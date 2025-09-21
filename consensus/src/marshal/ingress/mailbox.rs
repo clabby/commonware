@@ -1,9 +1,10 @@
 use crate::{
-    threshold_simplex::types::{Activity, Finalization, Notarization},
+    marshal::ingress::coding::CodedBlock,
+    threshold_simplex::types::{Activity, Finalization, Finalize, Notarization, Notarize},
     types::Round,
     Block, Reporter,
 };
-use commonware_cryptography::bls12381::primitives::variant::Variant;
+use commonware_cryptography::{bls12381::primitives::variant::Variant, Hasher, PublicKey};
 use futures::{
     channel::{mpsc, oneshot},
     SinkExt,
@@ -14,43 +15,64 @@ use tracing::error;
 ///
 /// These messages are sent from the consensus engine and other parts of the
 /// system to drive the state of the marshal.
-pub(crate) enum Message<V: Variant, B: Block> {
+pub(crate) enum Message<V, B, P, H>
+where
+    V: Variant,
+    B: Block<Digest = H::Digest, Commitment = H::Digest>,
+    P: PublicKey,
+    H: Hasher,
+{
     // -------------------- Application Messages --------------------
-    /// A request to retrieve a block by its digest.
+    /// A request to retrieve a block by its commitment.
     Get {
-        /// The digest of the block to retrieve.
+        /// The commitment of the block to retrieve.
         commitment: B::Commitment,
         /// A channel to send the retrieved block.
         response: oneshot::Sender<Option<B>>,
     },
-    /// A request to retrieve a block by its digest.
+    /// A request to retrieve a block by its commitment.
     Subscribe {
         /// The view in which the block was notarized. This is an optimization
         /// to help locate the block.
         round: Option<Round>,
-        /// The digest of the block to retrieve.
+        /// The coding commitment of the block to retrieve.
         commitment: B::Commitment,
         /// A channel to send the retrieved block.
         response: oneshot::Sender<B>,
     },
-    /// A request to broadcast a block to all peers.
+    /// A request to broadcast an erasure coded block to all peers.
     Broadcast {
         /// The block to broadcast.
-        block: B,
+        block: CodedBlock<B, H>,
+        /// The participants to share the block with.
+        participants: Vec<P>,
     },
-    /// A notification that a block has been verified by the application.
-    Verified {
-        /// The round in which the block was verified.
-        round: Round,
-        /// The verified block.
-        block: B,
+    /// A reqeuest to verify that a shard of a block at a given index is contained within
+    /// the given commitment.
+    VerifyShard {
+        /// The coding commitment of the block.
+        commitment: B::Commitment,
+        /// The index of the shard to verify.
+        index: u16,
+        /// The response channel to send the result of the verification.
+        response: oneshot::Sender<bool>,
     },
 
     // -------------------- Consensus Engine Messages --------------------
+    /// A single notarize vote from the consensus engine.
+    Notarize {
+        /// The notarization vote.
+        notarization: Notarize<V, B::Commitment>,
+    },
     /// A notarization from the consensus engine.
     Notarization {
         /// The notarization.
         notarization: Notarization<V, B::Commitment>,
+    },
+    /// A single finalization vote from the consensus engine.
+    Finalize {
+        /// The finalization vote.
+        finalization: Finalize<V, B::Commitment>,
     },
     /// A finalization from the consensus engine.
     Finalization {
@@ -61,13 +83,25 @@ pub(crate) enum Message<V: Variant, B: Block> {
 
 /// A mailbox for sending messages to the marshal [Actor](super::super::actor::Actor).
 #[derive(Clone)]
-pub struct Mailbox<V: Variant, B: Block> {
-    sender: mpsc::Sender<Message<V, B>>,
+pub struct Mailbox<V, B, P, H>
+where
+    V: Variant,
+    B: Block<Digest = H::Digest, Commitment = H::Digest>,
+    P: PublicKey,
+    H: Hasher,
+{
+    sender: mpsc::Sender<Message<V, B, P, H>>,
 }
 
-impl<V: Variant, B: Block> Mailbox<V, B> {
+impl<V, B, P, H> Mailbox<V, B, P, H>
+where
+    V: Variant,
+    B: Block<Digest = H::Digest, Commitment = H::Digest>,
+    P: PublicKey,
+    H: Hasher,
+{
     /// Creates a new mailbox.
-    pub(crate) fn new(sender: mpsc::Sender<Message<V, B>>) -> Self {
+    pub(crate) fn new(sender: mpsc::Sender<Message<V, B, P, H>>) -> Self {
         Self { sender }
     }
 
@@ -119,11 +153,14 @@ impl<V: Variant, B: Block> Mailbox<V, B> {
         rx
     }
 
-    /// Broadcast indicates that a block should be sent to all peers.
-    pub async fn broadcast(&mut self, block: B) {
+    /// Broadcast indicates that an erasure coded block should be broadcasted to a set of participants.
+    pub async fn broadcast(&mut self, block: CodedBlock<B, H>, participants: Vec<P>) {
         if self
             .sender
-            .send(Message::Broadcast { block })
+            .send(Message::Broadcast {
+                block,
+                participants,
+            })
             .await
             .is_err()
         {
@@ -131,25 +168,42 @@ impl<V: Variant, B: Block> Mailbox<V, B> {
         }
     }
 
-    /// Notifies the actor that a block has been verified.
-    pub async fn verified(&mut self, round: Round, block: B) {
+    /// Verifies that a shard of a block at a given index is contained within the given commitment.
+    pub async fn verify_shard(
+        &mut self,
+        commitment: B::Commitment,
+        index: u16,
+        response: oneshot::Sender<bool>,
+    ) {
         if self
             .sender
-            .send(Message::Verified { round, block })
+            .send(Message::VerifyShard {
+                commitment,
+                index,
+                response,
+            })
             .await
             .is_err()
         {
-            error!("failed to send verified message to actor: receiver dropped");
+            error!("failed to send verify shard message to actor: receiver dropped");
         }
     }
 }
 
-impl<V: Variant, B: Block> Reporter for Mailbox<V, B> {
+impl<V, B, P, H> Reporter for Mailbox<V, B, P, H>
+where
+    V: Variant,
+    B: Block<Digest = H::Digest, Commitment = H::Digest>,
+    P: PublicKey,
+    H: Hasher,
+{
     type Activity = Activity<V, B::Commitment>;
 
     async fn report(&mut self, activity: Self::Activity) {
         let message = match activity {
+            Activity::Notarize(notarization) => Message::Notarize { notarization },
             Activity::Notarization(notarization) => Message::Notarization { notarization },
+            Activity::Finalize(finalization) => Message::Finalize { finalization },
             Activity::Finalization(finalization) => Message::Finalization { finalization },
             _ => {
                 // Ignore other activity types

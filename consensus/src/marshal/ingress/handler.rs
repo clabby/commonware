@@ -168,7 +168,7 @@ impl<B: Block> Read for Request<B> {
 impl<B: Block> EncodeSize for Request<B> {
     fn encode_size(&self) -> usize {
         1 + match self {
-            Self::Block(block) => block.encode_size(),
+            Self::Block(commitment) => commitment.encode_size(),
             Self::Finalized { height } => height.encode_size(),
             Self::Notarized { round } => round.encode_size(),
         }

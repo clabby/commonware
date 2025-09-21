@@ -140,7 +140,7 @@ pub enum Error {
 }
 
 /// A piece of data from a Reed-Solomon encoded object.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Chunk<H: Hasher> {
     /// The shard of encoded data.
     pub shard: Vec<u8>,
@@ -210,6 +210,14 @@ impl<H: Hasher> EncodeSize for Chunk<H> {
         self.shard.encode_size() + self.index.encode_size() + self.proof.encode_size()
     }
 }
+
+impl<H: Hasher> PartialEq for Chunk<H> {
+    fn eq(&self, other: &Self) -> bool {
+        self.shard == other.shard && self.index == other.index && self.proof == other.proof
+    }
+}
+
+impl<H: Hasher> Eq for Chunk<H> {}
 
 /// All data shards from a Reed-Solomon encoded object.
 ///

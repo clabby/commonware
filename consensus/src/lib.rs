@@ -13,6 +13,8 @@
 use commonware_codec::Codec;
 use commonware_cryptography::{Committable, Digestible};
 
+use crate::types::View;
+
 pub mod aggregation;
 pub mod ordered_broadcast;
 pub mod simplex;
@@ -100,6 +102,34 @@ cfg_if::cfg_if! {
                 context: Self::Context,
                 payload: Self::Digest,
             ) -> impl Future<Output = oneshot::Receiver<bool>> + Send;
+        }
+
+        /// Application is the interface responsible for receiving signals from consensus to build blocks s well as
+        /// receiving a stream of finalized blocks from marshal.
+        pub trait Application: Clone + Send + 'static {
+            /// Context is metadata provided by the consensus engine associated with a given payload.
+            ///
+            /// This often includes things like the proposer, view number, the height, or the epoch.
+            type Context: Epochable;
+
+            /// The type of block produced by the application.
+            type Block: Block;
+
+            /// Payload used to initialize the consensus engine.
+            fn genesis(
+                &mut self,
+                epoch: <Self::Context as Epochable>::Epoch
+            ) -> impl Future<Output = <Self::Block as Committable>::Commitment> + Send;
+
+            /// Build a new block on top of a parent.
+            fn build(
+                &mut self,
+                view: View,
+                commitment: <Self::Block as Committable>::Commitment
+            ) -> impl Future<Output = Self::Block> + Send;
+
+            /// Receive a new finalized block from marshal.
+            fn finalize(&mut self, block: Self::Block) -> impl Future<Output = ()> + Send;
         }
 
         /// Relay is the interface responsible for broadcasting payloads to the network.

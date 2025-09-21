@@ -21,8 +21,8 @@ pub enum Orchestration<B: Block> {
     Processed {
         /// The height of the processed block.
         height: u64,
-        /// The digest of the processed block.
-        digest: B::Commitment,
+        /// The coding commitment of the processed block.
+        commitment: B::Commitment,
     },
     /// A request to repair a gap in the finalized block sequence.
     Repair {
@@ -62,10 +62,10 @@ impl<B: Block> Orchestrator<B> {
     }
 
     /// Notifies the actor that a block has been processed.
-    pub async fn processed(&mut self, height: u64, digest: B::Commitment) {
+    pub async fn processed(&mut self, height: u64, commitment: B::Commitment) {
         if self
             .sender
-            .send(Orchestration::Processed { height, digest })
+            .send(Orchestration::Processed { height, commitment })
             .await
             .is_err()
         {
