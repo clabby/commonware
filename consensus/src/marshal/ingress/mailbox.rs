@@ -3,7 +3,8 @@ use crate::{
     types::Round,
     Block, Reporter,
 };
-use commonware_cryptography::bls12381::primitives::variant::Variant;
+use commonware_coding::reed_solomon::Chunk;
+use commonware_cryptography::{bls12381::primitives::variant::Variant, Hasher, PublicKey};
 use futures::{
     channel::{mpsc, oneshot},
     SinkExt,
@@ -14,7 +15,7 @@ use tracing::error;
 ///
 /// These messages are sent from the consensus engine and other parts of the
 /// system to drive the state of the marshal.
-pub(crate) enum Message<V: Variant, B: Block> {
+pub(crate) enum Message<V: Variant, B: Block, P: PublicKey, H: Hasher> {
     // -------------------- Application Messages --------------------
     /// A request to retrieve a block by its digest.
     Get {
@@ -33,10 +34,14 @@ pub(crate) enum Message<V: Variant, B: Block> {
         /// A channel to send the retrieved block.
         response: oneshot::Sender<B>,
     },
-    /// A request to broadcast a block to all peers.
+    /// A request to broadcast an erasure coded block to all peers.
     Broadcast {
-        /// The block to broadcast.
-        block: B,
+        /// The coding commitment of the block.
+        coding_commitment: B::Commitment,
+        /// The erasure coding configuration.
+        config: (u16, u16),
+        /// The chunks and their corresponding participants.
+        chunks: Vec<(P, Chunk<H>)>,
     },
     /// A notification that a block has been verified by the application.
     Verified {
@@ -61,13 +66,13 @@ pub(crate) enum Message<V: Variant, B: Block> {
 
 /// A mailbox for sending messages to the marshal [Actor](super::super::actor::Actor).
 #[derive(Clone)]
-pub struct Mailbox<V: Variant, B: Block> {
-    sender: mpsc::Sender<Message<V, B>>,
+pub struct Mailbox<V: Variant, B: Block, P: PublicKey, H: Hasher> {
+    sender: mpsc::Sender<Message<V, B, P, H>>,
 }
 
-impl<V: Variant, B: Block> Mailbox<V, B> {
+impl<V: Variant, B: Block, P: PublicKey, H: Hasher> Mailbox<V, B, P, H> {
     /// Creates a new mailbox.
-    pub(crate) fn new(sender: mpsc::Sender<Message<V, B>>) -> Self {
+    pub(crate) fn new(sender: mpsc::Sender<Message<V, B, P, H>>) -> Self {
         Self { sender }
     }
 
@@ -120,10 +125,19 @@ impl<V: Variant, B: Block> Mailbox<V, B> {
     }
 
     /// Broadcast indicates that a block should be sent to all peers.
-    pub async fn broadcast(&mut self, block: B) {
+    pub async fn broadcast(
+        &mut self,
+        coding_commitment: B::Commitment,
+        config: (u16, u16),
+        chunks: Vec<(P, Chunk<H>)>,
+    ) {
         if self
             .sender
-            .send(Message::Broadcast { block })
+            .send(Message::Broadcast {
+                coding_commitment,
+                config,
+                chunks,
+            })
             .await
             .is_err()
         {
@@ -144,7 +158,7 @@ impl<V: Variant, B: Block> Mailbox<V, B> {
     }
 }
 
-impl<V: Variant, B: Block> Reporter for Mailbox<V, B> {
+impl<V: Variant, B: Block, P: PublicKey, H: Hasher> Reporter for Mailbox<V, B, P, H> {
     type Activity = Activity<V, B::Commitment>;
 
     async fn report(&mut self, activity: Self::Activity) {

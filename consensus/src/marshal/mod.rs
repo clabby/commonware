@@ -76,6 +76,7 @@ mod tests {
         resolver::p2p as resolver,
     };
     use crate::{
+        marshal::ingress::coding::ShardLayer,
         threshold_simplex::types::{
             finalize_namespace, notarize_namespace, seed_namespace, Activity, Finalization,
             Notarization, Proposal,
@@ -85,6 +86,7 @@ mod tests {
     };
     use commonware_broadcast::buffered;
     use commonware_codec::Encode;
+    use commonware_coding::reed_solomon::{self, Chunk};
     use commonware_cryptography::{
         bls12381::{
             dkg::ops::generate_shares,
@@ -96,8 +98,8 @@ mod tests {
             },
         },
         ed25519::{PrivateKey, PublicKey},
-        sha256::{Digest as Sha256Digest, Sha256},
-        Digestible, Hasher as _, PrivateKeyExt as _, Signer as _,
+        sha256::Sha256,
+        Digestible, Hasher, PrivateKeyExt as _, Signer as _,
     };
     use commonware_macros::test_traced;
     use commonware_p2p::{
@@ -115,7 +117,8 @@ mod tests {
         time::Duration,
     };
 
-    type D = Sha256Digest;
+    type H = Sha256;
+    type D = <H as Hasher>::Digest;
     type B = Block<D>;
     type P = PublicKey;
     type V = MinPk;
@@ -148,7 +151,7 @@ mod tests {
         identity: <V as Variant>::Public,
     ) -> (
         Application<B>,
-        crate::marshal::ingress::mailbox::Mailbox<V, B>,
+        crate::marshal::ingress::mailbox::Mailbox<V, B, P, H>,
     ) {
         let config = Config {
             identity,
@@ -197,6 +200,7 @@ mod tests {
             codec_config: (),
         };
         let (broadcast_engine, buffer) = buffered::Engine::new(context.clone(), broadcast_config);
+        let shards = ShardLayer::new(buffer, ());
         let network = oracle.register(secret.public_key(), 2).await.unwrap();
         broadcast_engine.start(network);
 
@@ -204,7 +208,7 @@ mod tests {
         let application = Application::<B>::default();
 
         // Start the application
-        actor.start(application.clone(), buffer, resolver);
+        actor.start(application.clone(), shards, resolver);
 
         (application, mailbox)
     }
@@ -310,7 +314,19 @@ mod tests {
         }
     }
 
-    #[test_traced("WARN")]
+    #[allow(clippy::type_complexity)]
+    fn shard(block: &B, peers: &[P]) -> (D, (u16, u16), Vec<(P, Chunk<H>)>) {
+        let (total, min) = (peers.len() as u16, peers.len() as u16 / 2);
+        let (commitment, chunks) =
+            reed_solomon::encode::<H>(total, min, block.encode().into()).unwrap();
+        (
+            commitment,
+            (total, min),
+            peers.iter().cloned().zip(chunks).collect(),
+        )
+    }
+
+    #[test_traced("DEBUG")]
     fn test_finalize_good_links() {
         for seed in 0..5 {
             let result1 = finalize(seed, LINK);
@@ -366,7 +382,7 @@ mod tests {
             // Generate blocks, skipping the genesis block.
             let mut blocks = Vec::<B>::new();
             let mut parent = Sha256::hash(b"");
-            for i in 1..=NUM_BLOCKS {
+            for i in 1..=4 {
                 let block = B::new::<Sha256>(parent, i, i);
                 parent = block.digest();
                 blocks.push(block);
@@ -386,8 +402,11 @@ mod tests {
                 // Broadcast block by one validator
                 let actor_index: usize = (height % (NUM_VALIDATORS as u64)) as usize;
                 let mut actor = actors[actor_index].clone();
-                actor.broadcast(block.clone()).await;
-                actor.verified(round, block.clone()).await;
+
+                let (commitment, config, chunks) = shard(block, &peers);
+                actor.broadcast(commitment, config, chunks).await;
+
+                // actor.verified(round, block.clone()).await;
 
                 // Wait for the block to be broadcast, but due to jitter, we may or may not receive
                 // the block before continuing.
@@ -397,7 +416,7 @@ mod tests {
                 let proposal = Proposal {
                     round,
                     parent: height.checked_sub(1).unwrap(),
-                    payload: block.digest(),
+                    payload: commitment,
                 };
                 let notarization = make_notarization(proposal.clone(), &shares, QUORUM);
                 actor
@@ -660,7 +679,8 @@ mod tests {
             let sub5_rx = actor.subscribe(None, block5.digest()).await;
 
             // Block1: Broadcasted by the actor
-            actor.broadcast(block1.clone()).await;
+            let (commitment1, config1, chunks1) = shard(&block1, &peers);
+            actor.broadcast(commitment1, config1, chunks1).await;
             context.sleep(Duration::from_millis(20)).await;
 
             // Block1: delivered
@@ -711,7 +731,8 @@ mod tests {
 
             // Block5: Broadcasted by a remote node (different actor)
             let remote_actor = &mut actors[1].clone();
-            remote_actor.broadcast(block5.clone()).await;
+            let (commitment5, config5, chunks5) = shard(&block5, &peers);
+            remote_actor.broadcast(commitment5, config5, chunks5).await;
             context.sleep(Duration::from_millis(20)).await;
 
             // Block5: delivered

@@ -81,10 +81,11 @@ where
         //     let _peers = self.broadcast(Recipients::All, chunk).await;
         // }
 
-        // DEBUG: Send all available shards to all peers.
+        // ---- DEBUG
         for shard in available_shards {
             let _peers = self.broadcast(Recipients::All, shard).await;
         }
+        // ---
     }
 
     /// Attempts to retrieve and reconstruct a [Block] by its coding commitment from a set of [Shard]s
@@ -110,7 +111,7 @@ where
         // Attempt to reconstruct the block from the available chunks.
         let block = self.try_reconstruct_block(commitment, coded_chunks, total, min);
 
-        // ---- dbg
+        // ---- DEBUG ----
         if let Ok(Some(ref blk)) = block {
             tracing::error!(?blk, "successfully reconstructed block");
         }
@@ -270,11 +271,8 @@ where
     type Digest = B::Digest;
 
     fn digest(&self) -> Self::Digest {
-        // TODO: This is a lil weird; only doing this to differentiate the broadcast chunk within
-        // the buffered mailbox, such that chunks from separate validators can be enqueued without
-        // replacing each other.
-        //
-        // The abstraction there is a bit weird for what I'm trying to do here.
+        // NOTE: This is a lil weird; only doing this to namespace the shard within the buffered mailbox, such that
+        // shards from separate validators can be enqueued without replacing each other.
         H::hash(self.chunk.encode().as_ref())
     }
 }

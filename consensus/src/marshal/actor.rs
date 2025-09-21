@@ -9,15 +9,14 @@ use super::{
     },
 };
 use crate::{
+    marshal::ingress::coding::ShardLayer,
     threshold_simplex::types::{Finalization, Notarization},
     types::Round,
     Block, Reporter,
 };
-use commonware_broadcast::{buffered, Broadcaster};
 use commonware_codec::{Decode, Encode};
-use commonware_cryptography::{bls12381::primitives::variant::Variant, PublicKey};
+use commonware_cryptography::{bls12381::primitives::variant::Variant, Hasher, PublicKey};
 use commonware_macros::select;
-use commonware_p2p::Recipients;
 use commonware_resolver::Resolver;
 use commonware_runtime::{Clock, Handle, Metrics, Spawner, Storage};
 use commonware_storage::archive::{immutable, Archive as _, Identifier};
@@ -56,13 +55,19 @@ struct BlockSubscription<B: Block> {
 /// finalization for a block that is ahead of its current view, it will request the missing blocks
 /// from its peers. This ensures that the actor can catch up to the rest of the network if it falls
 /// behind.
-pub struct Actor<B: Block, E: Rng + Spawner + Metrics + Clock + GClock + Storage, V: Variant> {
+pub struct Actor<
+    B: Block,
+    E: Rng + Spawner + Metrics + Clock + GClock + Storage,
+    V: Variant,
+    P: PublicKey,
+    H: Hasher,
+> {
     // ---------- Context ----------
     context: E,
 
     // ---------- Message Passing ----------
     // Mailbox
-    mailbox: mpsc::Receiver<Message<V, B>>,
+    mailbox: mpsc::Receiver<Message<V, B, P, H>>,
 
     // ---------- Configuration ----------
     // Identity
@@ -102,9 +107,16 @@ pub struct Actor<B: Block, E: Rng + Spawner + Metrics + Clock + GClock + Storage
     processed_height: Gauge,
 }
 
-impl<B: Block, E: Rng + Spawner + Metrics + Clock + GClock + Storage, V: Variant> Actor<B, E, V> {
+impl<
+        B: Block<Digest = H::Digest, Commitment = H::Digest> + std::fmt::Debug,
+        E: Rng + Spawner + Metrics + Clock + GClock + Storage,
+        V: Variant,
+        P: PublicKey,
+        H: Hasher,
+    > Actor<B, E, V, P, H>
+{
     /// Create a new application actor.
-    pub async fn init(context: E, config: Config<V, B>) -> (Self, Mailbox<V, B>) {
+    pub async fn init(context: E, config: Config<V, B>) -> (Self, Mailbox<V, B, P, H>) {
         // Initialize cache
         let prunable_config = cache::Config {
             partition_prefix: format!("{}-cache", config.partition_prefix.clone()),
@@ -231,28 +243,26 @@ impl<B: Block, E: Rng + Spawner + Metrics + Clock + GClock + Storage, V: Variant
     }
 
     /// Start the actor.
-    pub fn start<R, P>(
+    pub fn start<R>(
         mut self,
         application: impl Reporter<Activity = B>,
-        buffer: buffered::Mailbox<P, B>,
+        shards: ShardLayer<P, B, H>,
         resolver: (mpsc::Receiver<handler::Message<B>>, R),
     ) -> Handle<()>
     where
         R: Resolver<Key = handler::Request<B>>,
-        P: PublicKey,
     {
-        self.context.spawn_ref()(self.run(application, buffer, resolver))
+        self.context.spawn_ref()(self.run(application, shards, resolver))
     }
 
     /// Run the application actor.
-    async fn run<R, P>(
+    async fn run<R>(
         mut self,
         application: impl Reporter<Activity = B>,
-        mut buffer: buffered::Mailbox<P, B>,
+        mut shards: ShardLayer<P, B, H>,
         (mut resolver_rx, mut resolver): (mpsc::Receiver<handler::Message<B>>, R),
     ) where
         R: Resolver<Key = handler::Request<B>>,
-        P: PublicKey,
     {
         // Process all finalized blocks in order (fetching any that are missing)
         let (mut notifier_tx, notifier_rx) = mpsc::channel::<()>(1);
@@ -297,8 +307,8 @@ impl<B: Block, E: Rng + Spawner + Metrics + Clock + GClock + Storage, V: Variant
                         return;
                     };
                     match message {
-                        Message::Broadcast { block } => {
-                            let _peers = buffer.broadcast(Recipients::All, block).await;
+                        Message::Broadcast { coding_commitment, config, chunks } => {
+                            shards.broadcast_chunks(coding_commitment, config, chunks).await;
                         }
                         Message::Verified { round, block } => {
                             self.cache_verified(round, block.commitment(), block).await;
@@ -311,7 +321,7 @@ impl<B: Block, E: Rng + Spawner + Metrics + Clock + GClock + Storage, V: Variant
                             self.cache.put_notarization(round, commitment, notarization.clone()).await;
 
                             // Search for block locally, otherwise fetch it remotely
-                            if let Some(block) = self.find_block(&mut buffer, commitment).await {
+                            if let Some(block) = self.find_block(&mut shards, commitment).await {
                                 // If found, persist the block
                                 self.cache_block(round, commitment, block).await;
                             } else {
@@ -326,7 +336,7 @@ impl<B: Block, E: Rng + Spawner + Metrics + Clock + GClock + Storage, V: Variant
                             self.cache.put_finalization(round, commitment, finalization.clone()).await;
 
                             // Search for block locally, otherwise fetch it remotely
-                            if let Some(block) = self.find_block(&mut buffer, commitment).await {
+                            if let Some(block) = self.find_block(&mut shards, commitment).await {
                                 // If found, persist the block
                                 let height = block.height();
                                 self.finalize(height, commitment, block, Some(finalization), &mut notifier_tx).await;
@@ -339,12 +349,12 @@ impl<B: Block, E: Rng + Spawner + Metrics + Clock + GClock + Storage, V: Variant
                         }
                         Message::Get { commitment, response } => {
                             // Check for block locally
-                            let result = self.find_block(&mut buffer, commitment).await;
+                            let result = self.find_block(&mut shards, commitment).await;
                             let _ = response.send(result);
                         }
                         Message::Subscribe { round, commitment, response } => {
                             // Check for block locally
-                            if let Some(block) = self.find_block(&mut buffer, commitment).await {
+                            if let Some(block) = self.find_block(&mut shards, commitment).await {
                                 let _ = response.send(block);
                                 continue;
                             }
@@ -377,9 +387,9 @@ impl<B: Block, E: Rng + Spawner + Metrics + Clock + GClock + Storage, V: Variant
                                 }
                                 Entry::Vacant(entry) => {
                                     let (tx, rx) = oneshot::channel();
-                                    buffer.subscribe_prepared(None, commitment, None, tx).await;
+                                    shards.subscribe_prepared(commitment, tx).await;
                                     let aborter = waiters.push(async move {
-                                        (commitment, rx.await.expect("buffer subscriber closed"))
+                                        (commitment, rx.await.expect("shard subscriber closed"))
                                     });
                                     entry.insert(BlockSubscription {
                                         subscribers: vec![response],
@@ -444,7 +454,7 @@ impl<B: Block, E: Rng + Spawner + Metrics + Clock + GClock + Storage, V: Variant
                             // Iterate backwards, repairing blocks as we go.
                             while cursor.height() > height {
                                 let commitment = cursor.parent();
-                                if let Some(block) = self.find_block(&mut buffer, commitment).await {
+                                if let Some(block) = self.find_block(&mut shards, commitment).await {
                                     let finalization = self.cache.get_finalization_for(commitment).await;
                                     self.finalize(block.height(), commitment, block.clone(), finalization, &mut notifier_tx).await;
                                     debug!(height = block.height(), "repaired block");
@@ -480,7 +490,7 @@ impl<B: Block, E: Rng + Spawner + Metrics + Clock + GClock + Storage, V: Variant
                             match key {
                                 Request::Block(commitment) => {
                                     // Check for block locally
-                                    let Some(block) = self.find_block(&mut buffer, commitment).await else {
+                                    let Some(block) = self.find_block(&mut shards, commitment).await else {
                                         debug!(?commitment, "block missing on request");
                                         continue;
                                     };
@@ -511,7 +521,7 @@ impl<B: Block, E: Rng + Spawner + Metrics + Clock + GClock + Storage, V: Variant
 
                                     // Get block
                                     let commitment = notarization.proposal.payload;
-                                    let Some(block) = self.find_block(&mut buffer, commitment).await else {
+                                    let Some(block) = self.find_block(&mut shards, commitment).await else {
                                         debug!(?commitment, "block missing on request");
                                         continue;
                                     };
@@ -699,13 +709,13 @@ impl<B: Block, E: Rng + Spawner + Metrics + Clock + GClock + Storage, V: Variant
     // -------------------- Mixed Storage --------------------
 
     /// Looks for a block anywhere in local storage.
-    async fn find_block<P: PublicKey>(
+    async fn find_block(
         &mut self,
-        buffer: &mut buffered::Mailbox<P, B>,
+        shards: &mut ShardLayer<P, B, H>,
         commitment: B::Commitment,
     ) -> Option<B> {
-        // Check buffer.
-        if let Some(block) = buffer.get(None, commitment, None).await.into_iter().next() {
+        // Check shard layer.
+        if let Ok(Some(block)) = shards.get(commitment).await {
             return Some(block);
         }
         // Check verified / notarized blocks via cache manager.
