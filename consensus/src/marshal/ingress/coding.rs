@@ -48,7 +48,7 @@ where
     /// A map of coding commitments to block digests.
     ///
     /// TODO: This map has no durability nor pruning; just for testing / getting things working...
-    pub commitment_map: HashMap<B::Commitment, B::Digest>,
+    commitment_map: HashMap<B::Commitment, B::Digest>,
 
     /// A map of block digest to reconstructed blocks.
     ///
@@ -86,23 +86,29 @@ where
     }
 
     /// Broadcasts the local [Shard] of a block to all peers.
+    ///
+    /// TODO: This should only send out the shard that was assigned to the local validator.
     pub async fn try_broadcast_mine(&mut self, commitment: B::Commitment) {
         let available_shards = self.mailbox.get(None, commitment, None).await;
 
-        // if let Some(chunk) = available_chunks.into_iter().next() {
-        //     let _peers = self.broadcast(Recipients::All, chunk).await;
-        // }
-
-        // ---- DEBUG; Send all available shards to all peers ----
         for shard in available_shards {
             let _peers = self.broadcast(Recipients::All, shard).await;
         }
-        // ---
     }
 
     /// Attempts to fetch a cached reconstructed [Block] by its digest.
     pub fn get(&mut self, digest: B::Digest) -> Option<B> {
         self.reconstruction_cache.get(&digest).cloned()
+    }
+
+    /// Checks if the shard layer has the digest corresponding to a given coding commitment.
+    pub fn has_digest(&self, commitment: &B::Commitment) -> bool {
+        self.commitment_map.contains_key(commitment)
+    }
+
+    /// Gets the digest corresponding to a given coding commitment, if known.
+    pub fn get_digest(&self, commitment: &B::Commitment) -> Option<B::Digest> {
+        self.commitment_map.get(commitment).copied()
     }
 
     /// Attempts to retrieve and reconstruct a [Block] by its coding commitment from a set of [Shard]s

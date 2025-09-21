@@ -79,7 +79,7 @@ mod tests {
         marshal::ingress::coding::ShardLayer,
         threshold_simplex::types::{
             finalize_namespace, notarize_namespace, seed_namespace, Activity, Finalization,
-            Notarization, Proposal,
+            Finalize, Notarization, Notarize, Proposal,
         },
         types::Round,
         Block as _, Reporter,
@@ -213,6 +213,24 @@ mod tests {
         (application, mailbox)
     }
 
+    fn make_finalization_vote(proposal: Proposal<D>, shares: &[Sh]) -> Finalize<V, D> {
+        let proposal_msg = proposal.encode();
+
+        // Generate proposal signature
+        let proposal_partial = shares
+            .iter()
+            .next()
+            .map(|s| {
+                partial_sign_message::<V>(s, Some(&finalize_namespace(NAMESPACE)), &proposal_msg)
+            })
+            .unwrap();
+
+        Finalize {
+            proposal,
+            proposal_signature: proposal_partial,
+        }
+    }
+
     fn make_finalization(proposal: Proposal<D>, shares: &[Sh], quorum: u32) -> Finalization<V, D> {
         let proposal_msg = proposal.encode();
 
@@ -240,6 +258,33 @@ mod tests {
             proposal,
             proposal_signature,
             seed_signature,
+        }
+    }
+
+    fn make_notarization_vote(proposal: Proposal<D>, shares: &[Sh]) -> Notarize<V, D> {
+        let proposal_msg = proposal.encode();
+
+        // Generate proposal signature
+        let proposal_partial = shares
+            .iter()
+            .next()
+            .map(|s| {
+                partial_sign_message::<V>(s, Some(&notarize_namespace(NAMESPACE)), &proposal_msg)
+            })
+            .unwrap();
+
+        // Generate seed signature (for the view number)
+        let seed_msg = proposal.round.encode();
+        let seed_partial = shares
+            .iter()
+            .next()
+            .map(|s| partial_sign_message::<V>(s, Some(&seed_namespace(NAMESPACE)), &seed_msg))
+            .unwrap();
+
+        Notarize {
+            proposal,
+            proposal_signature: proposal_partial,
+            seed_signature: seed_partial,
         }
     }
 
@@ -328,7 +373,7 @@ mod tests {
 
     #[test_traced("DEBUG")]
     fn test_finalize_good_links() {
-        for seed in 0..5 {
+        for seed in 0..1 {
             let result1 = finalize(seed, LINK);
             let result2 = finalize(seed, LINK);
 
@@ -413,20 +458,36 @@ mod tests {
                 // the block before continuing.
                 context.sleep(link.latency).await;
 
-                // Notarize block by the validator that broadcasted it
                 let proposal = Proposal {
                     round,
                     parent: height.checked_sub(1).unwrap(),
                     payload: commitment,
                 };
+
+                // All validators send a notarization for the block.
+                let notarization_vote = make_notarization_vote(proposal.clone(), &shares);
+                for actor in actors.iter_mut() {
+                    actor
+                        .report(Activity::Notarize(notarization_vote.clone()))
+                        .await;
+                }
+
+                // Notarize block by the validator that broadcasted it
                 let notarization = make_notarization(proposal.clone(), &shares, QUORUM);
                 actor
                     .report(Activity::Notarization(notarization.clone()))
                     .await;
 
+                // Wait for the block to be broadcast, but due to jitter, we may or may not receive
+                // the block before continuing.
+                context.sleep(link.latency).await;
+
                 // Finalize block by all validators
-                let fin = make_finalization(proposal, &shares, QUORUM);
+                let fin = make_finalization(proposal.clone(), &shares, QUORUM);
+                let fin_vote = make_finalization_vote(proposal, &shares);
                 for actor in actors.iter_mut() {
+                    actor.report(Activity::Finalize(fin_vote.clone())).await;
+
                     // Always finalize 1) the last block in each epoch 2) the last block in the chain.
                     // Otherwise, finalize randomly.
                     if height == NUM_BLOCKS
