@@ -14,9 +14,9 @@ use commonware_coding::reed_solomon::{decode, Chunk, Error as ReedSolomonError};
 use commonware_cryptography::{Committable, Digestible, Hasher, PublicKey};
 use commonware_p2p::Recipients;
 use futures::channel::oneshot;
-use std::{fmt::Debug, ops::Deref};
+use std::{collections::HashMap, fmt::Debug, ops::Deref};
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, info};
 
 const MAX_SHARD_SIZE: usize = 1024 * 1024; // 1 MiB - tune? seems reasonable.
 
@@ -44,6 +44,16 @@ where
 
     /// [`Read`] configuration for the block type.
     block_codec_cfg: B::Cfg,
+
+    /// A map of coding commitments to block digests.
+    ///
+    /// TODO: This map has no durability nor pruning; just for testing / getting things working...
+    pub commitment_map: HashMap<B::Commitment, B::Digest>,
+
+    /// A map of block digest to reconstructed blocks.
+    ///
+    /// TODO: This map has no durability nor pruning; just for testing / getting things working...
+    reconstruction_cache: HashMap<B::Digest, B>,
 }
 
 impl<P, B, H> ShardLayer<P, B, H>
@@ -57,6 +67,8 @@ where
         Self {
             mailbox,
             block_codec_cfg: cfg,
+            commitment_map: HashMap::new(),
+            reconstruction_cache: HashMap::new(),
         }
     }
 
@@ -73,7 +85,7 @@ where
         }
     }
 
-    /// Broadcasts the local erasure coded [Chunk] of a block to all peers.
+    /// Broadcasts the local [Shard] of a block to all peers.
     pub async fn try_broadcast_mine(&mut self, commitment: B::Commitment) {
         let available_shards = self.mailbox.get(None, commitment, None).await;
 
@@ -81,11 +93,16 @@ where
         //     let _peers = self.broadcast(Recipients::All, chunk).await;
         // }
 
-        // ---- DEBUG
+        // ---- DEBUG; Send all available shards to all peers ----
         for shard in available_shards {
             let _peers = self.broadcast(Recipients::All, shard).await;
         }
         // ---
+    }
+
+    /// Attempts to fetch a cached reconstructed [Block] by its digest.
+    pub fn get(&mut self, digest: B::Digest) -> Option<B> {
+        self.reconstruction_cache.get(&digest).cloned()
     }
 
     /// Attempts to retrieve and reconstruct a [Block] by its coding commitment from a set of [Shard]s
@@ -95,29 +112,47 @@ where
     /// block, it will return `Ok(None)`.
     ///
     /// If there was an error during reconstruction, a [ReconstructionError] will be returned.
-    pub async fn get(
+    pub async fn try_reconstruct(
         &mut self,
         commitment: B::Commitment,
-    ) -> Result<Option<B>, ReconstructionError> {
-        // Request all available chunks for the given commitment from peers.
+    ) -> Result<(), ReconstructionError> {
         let available_chunks = self.mailbox.get(None, commitment, None).await;
 
         let Some((total, min)) = available_chunks.first().map(|c| c.config) else {
             // No chunks available.
-            return Ok(None);
+            return Ok(());
         };
-        let coded_chunks = available_chunks.iter().cloned().map(|c| c.chunk).collect();
+        let coded_chunks = available_chunks
+            .iter()
+            .cloned()
+            .map(|c| c.chunk)
+            .collect::<Vec<_>>();
 
-        // Attempt to reconstruct the block from the available chunks.
-        let block = self.try_reconstruct_block(commitment, coded_chunks, total, min);
+        if coded_chunks.len() < min as usize {
+            // Not enough chunks to recover the block yet.
+            debug!(
+                %commitment,
+                have = coded_chunks.len(),
+                need = min,
+                "not enough chunks to reconstruct block",
+            );
+            return Ok(());
+        }
+
+        // Attempt to recover the block from the available chunks. This process will also
+        // check the chunks' inclusion within the commitment.
+        let recovered = decode(total, min, &commitment, coded_chunks)?;
+
+        // Attempt to decode the block from the recovered data.
+        let block = B::decode_cfg(&mut recovered.as_slice(), &self.block_codec_cfg)?;
 
         // ---- DEBUG ----
-        if let Ok(Some(ref blk)) = block {
-            tracing::error!(?blk, "successfully reconstructed block");
-        }
+        info!(%commitment, ?block, "successfully reconstructed block");
+        self.commitment_map.insert(commitment, block.digest());
+        self.reconstruction_cache.insert(block.digest(), block);
         // ----
 
-        block
+        Ok(())
     }
 
     /// Subscribes to a block by commitment with an externally prepared responder.
@@ -131,34 +166,6 @@ where
         _responder: oneshot::Sender<B>,
     ) -> Result<(), ReconstructionError> {
         todo!("Subscribe to all chunks, reconstruct block when enough are available.");
-    }
-
-    /// Attempts to reconstruct a [Block] from the given [Chunk]s and coding configuration.
-    fn try_reconstruct_block(
-        &mut self,
-        block_commitment: B::Commitment,
-        chunks: Vec<Chunk<H>>,
-        total: u16,
-        min: u16,
-    ) -> Result<Option<B>, ReconstructionError> {
-        if chunks.len() < min as usize {
-            // Not enough chunks to recover the block.
-            debug!(
-                have = chunks.len(),
-                need = min,
-                "not enough chunks to reconstruct block",
-            );
-            return Ok(None);
-        }
-
-        // Attempt to recover the block from the available chunks. This process will also
-        // check the chunks' inclusion within the commitment.
-        let recovered = decode(total, min, &block_commitment, chunks)?;
-
-        // Attempt to decode the block from the recovered data.
-        let block = B::decode_cfg(&mut recovered.as_slice(), &self.block_codec_cfg)?;
-
-        Ok(Some(block))
     }
 }
 
@@ -182,9 +189,9 @@ where
     }
 }
 
-/// A broadcastable, erasure coded chunk of a [Block].
+/// A broadcastable, erasure coded [Chunk] of a [Block].
 ///
-/// Each chunk is associated with a block hash and a commitment to the full block's
+/// Each chunk is associated with a commitment to the full block's
 /// erasure coded data. This allows recipients to verify the integrity of the chunk
 /// (to varying degrees; For reed-solomon which is currently hard-coded, no guarantee
 /// of the chunk's correctness is possible without additional chunks.)

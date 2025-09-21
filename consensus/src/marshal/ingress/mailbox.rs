@@ -1,5 +1,5 @@
 use crate::{
-    threshold_simplex::types::{Activity, Finalization, Notarization},
+    threshold_simplex::types::{Activity, Finalization, Finalize, Notarization, Notarize},
     types::Round,
     Block, Reporter,
 };
@@ -52,10 +52,20 @@ pub(crate) enum Message<V: Variant, B: Block, P: PublicKey, H: Hasher> {
     },
 
     // -------------------- Consensus Engine Messages --------------------
+    /// A single notarize vote from the consensus engine.
+    Notarize {
+        /// The notarization vote.
+        notarization: Notarize<V, B::Commitment>,
+    },
     /// A notarization from the consensus engine.
     Notarization {
         /// The notarization.
         notarization: Notarization<V, B::Commitment>,
+    },
+    /// A single finalization vote from the consensus engine.
+    Finalize {
+        /// The finalization vote.
+        finalization: Finalize<V, B::Commitment>,
     },
     /// A finalization from the consensus engine.
     Finalization {
@@ -163,7 +173,9 @@ impl<V: Variant, B: Block, P: PublicKey, H: Hasher> Reporter for Mailbox<V, B, P
 
     async fn report(&mut self, activity: Self::Activity) {
         let message = match activity {
+            Activity::Notarize(notarization) => Message::Notarize { notarization },
             Activity::Notarization(notarization) => Message::Notarization { notarization },
+            Activity::Finalize(finalization) => Message::Finalize { finalization },
             Activity::Finalization(finalization) => Message::Finalization { finalization },
             _ => {
                 // Ignore other activity types

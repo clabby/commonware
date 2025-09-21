@@ -313,38 +313,74 @@ impl<
                         Message::Verified { round, block } => {
                             self.cache_verified(round, block.commitment(), block).await;
                         }
+                        Message::Notarize { .. } => {
+                            // TODO: If the notarization vote was sent from self, broadcast our chunk.
+                        }
                         Message::Notarization { notarization } => {
                             let round = notarization.round();
                             let commitment = notarization.proposal.payload;
 
+                            // DEBUG: Broadcast my chunks; This should be done on a one-by-one basis
+                            // with a new message from consensus on individual notarization votes.
+                            //
+                            // For initial testing, we just send out _all_ of our chunks for the commitment.
+                            shards.try_broadcast_mine(commitment).await;
+
+                            // Block on waiting for the block to be reconstructed.
+                            while !shards.commitment_map.contains_key(&commitment) {
+                                dbg!("spinning");
+                                shards.try_reconstruct(commitment).await.expect("Reconstruction error not yet handled");
+                            }
+
+                            let digest = shards.commitment_map.get(&commitment).copied().unwrap();
+
                             // Store notarization by view
-                            self.cache.put_notarization(round, commitment, notarization.clone()).await;
+                            self.cache.put_notarization(round, digest, notarization.clone()).await;
 
                             // Search for block locally, otherwise fetch it remotely
-                            if let Some(block) = self.find_block(&mut shards, commitment).await {
+                            if let Some(block) = self.find_block(&mut shards, digest).await {
                                 // If found, persist the block
-                                self.cache_block(round, commitment, block).await;
+                                self.cache_block(round, digest, block).await;
                             } else {
                                 debug!(?round, "notarized block missing");
                                 resolver.fetch(Request::<B>::Notarized { round }).await;
                             }
                         }
+                        Message::Finalize { .. } => {
+                            // TODO: If the finalize vote was sent from self, broadcast our chunk.
+                        }
                         Message::Finalization { finalization } => {
                             // Cache finalization by round
                             let round = finalization.round();
                             let commitment = finalization.proposal.payload;
-                            self.cache.put_finalization(round, commitment, finalization.clone()).await;
+
+                            // DEBUG: Broadcast my chunks; This should be done on a one-by-one basis
+                            // with a new message from consensus on individual finalization votes.
+                            //
+                            // For initial testing, we just send out _all_ of our chunks for the commitment.
+                            shards.try_broadcast_mine(commitment).await;
+
+                            // Block on waiting for the block to be reconstructed; We cannot move forward without
+                            // having the block digest.
+                            while !shards.commitment_map.contains_key(&commitment) {
+                                dbg!("spinning");
+                                shards.try_reconstruct(commitment).await.expect("Reconstruction error not yet handled");
+                            }
+
+                            let digest = shards.commitment_map.get(&commitment).copied().unwrap();
+
+                            self.cache.put_finalization(round, digest, finalization.clone()).await;
 
                             // Search for block locally, otherwise fetch it remotely
-                            if let Some(block) = self.find_block(&mut shards, commitment).await {
+                            if let Some(block) = self.find_block(&mut shards, digest).await {
                                 // If found, persist the block
                                 let height = block.height();
-                                self.finalize(height, commitment, block, Some(finalization), &mut notifier_tx).await;
+                                self.finalize(height, digest, block, Some(finalization), &mut notifier_tx).await;
                                 debug!(?round, height, "finalized block stored");
                             } else {
                                 // Otherwise, fetch the block from the network.
-                                debug!(?round, ?commitment, "finalized block missing");
-                                resolver.fetch(Request::<B>::Block(commitment)).await;
+                                debug!(?round, ?digest, "finalized block missing");
+                                resolver.fetch(Request::<B>::Block(digest)).await;
                             }
                         }
                         Message::Get { commitment, response } => {
@@ -387,7 +423,7 @@ impl<
                                 }
                                 Entry::Vacant(entry) => {
                                     let (tx, rx) = oneshot::channel();
-                                    shards.subscribe_prepared(commitment, tx).await;
+                                    shards.subscribe_prepared(commitment, tx).await.unwrap();
                                     let aborter = waiters.push(async move {
                                         (commitment, rx.await.expect("shard subscriber closed"))
                                     });
@@ -521,7 +557,15 @@ impl<
 
                                     // Get block
                                     let commitment = notarization.proposal.payload;
-                                    let Some(block) = self.find_block(&mut shards, commitment).await else {
+                                    let digest = match shards.commitment_map.get(&commitment) {
+                                        Some(digest) => *digest,
+                                        None => {
+                                            debug!(?commitment, "notarized block missing commitment mapping on request");
+                                            continue;
+                                        }
+                                    };
+
+                                    let Some(block) = self.find_block(&mut shards, digest).await else {
                                         debug!(?commitment, "block missing on request");
                                         continue;
                                     };
@@ -539,10 +583,11 @@ impl<
                                     };
 
                                     // Validation
-                                    if block.commitment() != commitment {
-                                        let _ = response.send(false);
-                                        continue;
-                                    }
+                                    // TODO: Block commitment is not the same as the coding commitment
+                                    // if block.commitment() != commitment {
+                                    //     let _ = response.send(false);
+                                    //     continue;
+                                    // }
 
                                     // Persist the block, also persisting the finalization if we have it
                                     let height = block.height();
@@ -560,7 +605,8 @@ impl<
 
                                     // Validation
                                     if block.height() != height
-                                        || finalization.proposal.payload != block.commitment()
+                                        // TODO: Block commitment != coding commitment
+                                        // || finalization.proposal.payload != block.commitment()
                                         || !finalization.verify(&self.namespace, &self.identity)
                                     {
                                         let _ = response.send(false);
@@ -581,7 +627,8 @@ impl<
 
                                     // Validation
                                     if notarization.round() != round
-                                        || notarization.proposal.payload != block.commitment()
+                                        // TODO: Block commitment != coding commitment
+                                        // || notarization.proposal.payload != block.commitment()
                                         || !notarization.verify(&self.namespace, &self.identity)
                                     {
                                         let _ = response.send(false);
@@ -715,7 +762,7 @@ impl<
         commitment: B::Commitment,
     ) -> Option<B> {
         // Check shard layer.
-        if let Ok(Some(block)) = shards.get(commitment).await {
+        if let Some(block) = shards.get(commitment) {
             return Some(block);
         }
         // Check verified / notarized blocks via cache manager.

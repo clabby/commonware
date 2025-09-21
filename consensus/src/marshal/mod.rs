@@ -351,8 +351,8 @@ mod tests {
     fn finalize(seed: u64, link: Link) -> String {
         let runner = deterministic::Runner::new(
             deterministic::Config::new()
-                .with_seed(seed)
-                .with_timeout(Some(Duration::from_secs(300))),
+                .with_timeout(Some(Duration::from_secs(300)))
+                .with_seed(seed),
         );
         runner.start(|mut context| async move {
             let mut oracle = setup_network(context.clone());
@@ -379,10 +379,13 @@ mod tests {
             // Add links between all peers
             setup_network_links(&mut oracle, &peers, link.clone()).await;
 
+            // Smaller number of blocks for debugging; rm later.
+            const NUM_BLOCKS: u64 = 4;
+
             // Generate blocks, skipping the genesis block.
             let mut blocks = Vec::<B>::new();
             let mut parent = Sha256::hash(b"");
-            for i in 1..=4 {
+            for i in 1..=NUM_BLOCKS {
                 let block = B::new::<Sha256>(parent, i, i);
                 parent = block.digest();
                 blocks.push(block);
@@ -405,8 +408,6 @@ mod tests {
 
                 let (commitment, config, chunks) = shard(block, &peers);
                 actor.broadcast(commitment, config, chunks).await;
-
-                // actor.verified(round, block.clone()).await;
 
                 // Wait for the block to be broadcast, but due to jitter, we may or may not receive
                 // the block before continuing.
@@ -453,6 +454,8 @@ mod tests {
                     if app.blocks().len() != NUM_BLOCKS as usize {
                         finished = false;
                         break;
+                    } else {
+                        dbg!(app.blocks());
                     }
                 }
             }
