@@ -325,23 +325,13 @@ impl<
                             let round = notarization.round();
                             let commitment = notarization.proposal.payload;
 
-                            // Block on waiting for the block to be reconstructed; We cannot move forward without
-                            // having the block digest.
-                            while !shard_layer.has_digest(&commitment).await {
-                                dbg!("spinning");
-                                shard_layer.try_reconstruct(commitment).await.expect("Reconstruction error not yet handled");
-                            }
-
-                            // Request the block digest for the block corresponding to the coding commitment.
-                            let digest = shard_layer.get_digest(&commitment).await.unwrap();
-
                             // Store notarization by view
-                            self.cache.put_notarization(round, digest, notarization.clone()).await;
+                            self.cache.put_notarization(round, commitment, notarization.clone()).await;
 
                             // Search for block locally, otherwise fetch it remotely
-                            if let Some(block) = self.find_block(&mut shard_layer, digest).await {
+                            if let Some(block) = self.find_block(&mut shard_layer, commitment).await {
                                 // If found, persist the block
-                                self.cache_block(round, digest, block).await;
+                                self.cache_block(round, commitment, block).await;
                             } else {
                                 debug!(?round, "notarized block missing");
                                 resolver.fetch(Request::<B>::Notarized { round }).await;
@@ -360,28 +350,18 @@ impl<
                             let round = finalization.round();
                             let commitment = finalization.proposal.payload;
 
-                            // Block on waiting for the block to be reconstructed; We cannot move forward without
-                            // having the block digest.
-                            while !shard_layer.has_digest(&commitment).await {
-                                dbg!("spinning");
-                                shard_layer.try_reconstruct(commitment).await.expect("Reconstruction error not yet handled");
-                            }
-
-                            // Request the block digest for the block corresponding to the coding commitment.
-                            let digest = shard_layer.get_digest(&commitment).await.unwrap();
-
-                            self.cache.put_finalization(round, digest, finalization.clone()).await;
+                            self.cache.put_finalization(round, commitment, finalization.clone()).await;
 
                             // Search for block locally, otherwise fetch it remotely
-                            if let Some(block) = self.find_block(&mut shard_layer, digest).await {
+                            if let Some(block) = self.find_block(&mut shard_layer, commitment).await {
                                 // If found, persist the block
                                 let height = block.height();
-                                self.finalize(height, digest, block, Some(finalization), &mut notifier_tx).await;
+                                self.finalize(height, commitment, block, Some(finalization), &mut notifier_tx).await;
                                 debug!(?round, height, "finalized block stored");
                             } else {
                                 // Otherwise, fetch the block from the network.
-                                debug!(?round, ?digest, "finalized block missing");
-                                resolver.fetch(Request::<B>::Block(digest)).await;
+                                debug!(?round, ?commitment, "finalized block missing");
+                                resolver.fetch(Request::<B>::Block(commitment)).await;
                             }
                         }
                         Message::Get { commitment, response } => {
@@ -492,6 +472,11 @@ impl<
                             // Iterate backwards, repairing blocks as we go.
                             while cursor.height() > height {
                                 let commitment = cursor.parent();
+                                let Some(commitment) = shard_layer.get_digest(&commitment).await else {
+                                    dbg!("Missing block digest");
+                                    break;
+                                };
+
                                 if let Some(block) = self.find_block(&mut shard_layer, commitment).await {
                                     let finalization = self.cache.get_finalization_for(commitment).await;
                                     self.finalize(block.height(), commitment, block.clone(), finalization, &mut notifier_tx).await;
@@ -559,15 +544,7 @@ impl<
 
                                     // Get block
                                     let commitment = notarization.proposal.payload;
-                                    let digest = match shard_layer.get_digest(&commitment).await {
-                                        Some(digest) => digest,
-                                        None => {
-                                            debug!(?commitment, "notarized block missing commitment mapping on request");
-                                            continue;
-                                        }
-                                    };
-
-                                    let Some(block) = self.find_block(&mut shard_layer, digest).await else {
+                                    let Some(block) = self.find_block(&mut shard_layer, commitment).await else {
                                         debug!(?commitment, "block missing on request");
                                         continue;
                                     };
@@ -760,7 +737,7 @@ impl<
     ) -> Option<B> {
         // Check shard layer.
         if let Some(block) = shards
-            .block_by_digest(commitment)
+            .try_reconstruct(commitment)
             .await
             .expect("reconstruction error not yet handled")
         {

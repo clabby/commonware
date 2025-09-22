@@ -75,9 +75,6 @@ where
     block_codec_cfg: B::Cfg,
 
     /// Map of block digests -> coding commitments.
-    commitment_map: prunable::Archive<TwoCap, E, H::Digest, H::Digest>,
-
-    /// Map of coding commitments -> block digests.
     digest_map: prunable::Archive<TwoCap, E, H::Digest, H::Digest>,
 }
 
@@ -105,10 +102,6 @@ where
             replay_buffer: cfg.replay_buffer,
             write_buffer: cfg.write_buffer,
         };
-        let commitment_map =
-            prunable::Archive::init(context.with_label("commitment-map"), cfg("commitment"))
-                .await
-                .unwrap_or_else(|_| panic!("Failed to initialize commitment archive"));
         let digest_map = prunable::Archive::init(context.with_label("digest-map"), cfg("digest"))
             .await
             .unwrap_or_else(|_| panic!("Failed to initialize digest archive"));
@@ -116,7 +109,6 @@ where
         Self {
             mailbox,
             block_codec_cfg,
-            commitment_map,
             digest_map,
         }
     }
@@ -186,12 +178,8 @@ where
         // Attempt to decode the block from the recovered data.
         let block = B::decode_cfg(&mut recovered.as_slice(), &self.block_codec_cfg)?;
 
-        self.commitment_map
-            .put(block.height(), commitment, block.digest())
-            .await
-            .expect("failed to put commitment");
         self.digest_map
-            .put(block.height(), block.digest(), commitment)
+            .put(block.height(), commitment, block.digest())
             .await
             .expect("failed to put digest");
 
@@ -213,45 +201,20 @@ where
         todo!("Subscribe to all chunks, reconstruct block when enough are available.");
     }
 
-    /// Attempts to fetch a reconstructed [Block] by its digest.
-    pub async fn block_by_digest(
-        &mut self,
-        digest: B::Digest,
-    ) -> Result<Option<B>, ReconstructionError> {
-        match self
-            .digest_map
-            .get(Identifier::Key(&digest))
-            .await
-            .expect("failed to get digest")
-        {
-            Some(commitment) => self.try_reconstruct(commitment).await,
-            None => Ok(None),
-        }
-    }
-
-    /// Checks if the shard layer has the digest corresponding to a given coding commitment.
-    pub async fn has_digest(&self, commitment: &B::Commitment) -> bool {
-        self.commitment_map
-            .has(Identifier::Key(commitment))
-            .await
-            .expect("failed to get commitment")
-    }
-
-    /// Gets the digest corresponding to a given coding commitment, if known.
-    pub async fn get_digest(&self, commitment: &B::Commitment) -> Option<B::Digest> {
-        self.commitment_map
+    /// Gets the block digest for a block with the given coding commitment, if known.
+    pub async fn get_digest(&mut self, commitment: &B::Commitment) -> Option<B::Digest> {
+        self.digest_map
             .get(Identifier::Key(commitment))
             .await
-            .expect("failed to get commitment")
+            .expect("failed to get digest")
     }
 
     /// Prunes old entries from the internal maps.
     pub async fn prune(&mut self, up_to: u64) {
-        futures::try_join!(
-            self.commitment_map.prune(up_to),
-            self.digest_map.prune(up_to)
-        )
-        .expect("failed to prune maps");
+        self.digest_map
+            .prune(up_to)
+            .await
+            .expect("failed to prune maps");
     }
 }
 
