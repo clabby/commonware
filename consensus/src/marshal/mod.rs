@@ -76,7 +76,7 @@ mod tests {
         resolver::p2p as resolver,
     };
     use crate::{
-        marshal::ingress::coding::ShardLayer,
+        marshal::ingress::coding::{self, ShardLayer},
         threshold_simplex::types::{
             finalize_namespace, notarize_namespace, seed_namespace, Activity, Finalization,
             Finalize, Notarization, Notarize, Proposal,
@@ -113,7 +113,7 @@ mod tests {
     use rand::{seq::SliceRandom, Rng};
     use std::{
         collections::BTreeMap,
-        num::{NonZeroU32, NonZeroUsize},
+        num::{NonZero, NonZeroU32, NonZeroUsize},
         time::Duration,
     };
 
@@ -200,9 +200,17 @@ mod tests {
             codec_config: (),
         };
         let (broadcast_engine, buffer) = buffered::Engine::new(context.clone(), broadcast_config);
-        let shards = ShardLayer::new(buffer, ());
         let network = oracle.register(secret.public_key(), 2).await.unwrap();
         broadcast_engine.start(network);
+
+        let shard_config = coding::Config {
+            partition_prefix: "shards".to_string(),
+            items_per_section: NonZero::new(100).unwrap(),
+            replay_buffer: NonZero::new(100).unwrap(),
+            write_buffer: NonZero::new(100).unwrap(),
+            buffer_pool: PoolRef::new(PAGE_SIZE, PAGE_CACHE_SIZE),
+        };
+        let shards = ShardLayer::init(context.with_label("shard"), shard_config, buffer, ()).await;
 
         let (actor, mailbox) = actor::Actor::init(context.clone(), config).await;
         let application = Application::<B>::default();

@@ -13,8 +13,19 @@ use commonware_codec::{Encode, EncodeSize, Error as CodecError, Read, ReadExt, W
 use commonware_coding::reed_solomon::{decode, Chunk, Error as ReedSolomonError};
 use commonware_cryptography::{Committable, Digestible, Hasher, PublicKey};
 use commonware_p2p::Recipients;
+use commonware_runtime::{buffer::PoolRef, Clock, Metrics, Spawner, Storage};
+use commonware_storage::{
+    archive::{prunable, Archive, Identifier},
+    translator::TwoCap,
+};
 use futures::channel::oneshot;
-use std::{collections::HashMap, fmt::Debug, ops::Deref};
+use governor::clock::Clock as GClock;
+use rand::Rng;
+use std::{
+    fmt::Debug,
+    num::{NonZero, NonZeroUsize},
+    ops::Deref,
+};
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -30,11 +41,29 @@ pub enum ReconstructionError {
     Codec(#[from] CodecError),
 }
 
+/// Storage configuration for the [ShardLayer].
+pub struct Config {
+    /// Namespace prefix for the underlying storage partitions.
+    pub partition_prefix: String,
+
+    /// Number of items per section in the [prunable::Archive].
+    pub items_per_section: NonZero<u64>,
+
+    /// Rpelay buffer size for the [prunable::Archive].
+    pub replay_buffer: NonZeroUsize,
+
+    /// Write buffer size for the [prunable::Archive].
+    pub write_buffer: NonZeroUsize,
+
+    /// Buffer pool for the [prunable::Archive].
+    pub buffer_pool: PoolRef,
+}
+
 /// A layer that handles receiving erasure coded [Block]s from the [Actor](super::super::actor::Actor),
 /// broadcasting them to peers, and reassembling them from received [Shard]s.
-#[derive(Clone)]
-pub struct ShardLayer<P, B, H>
+pub struct ShardLayer<E, P, B, H>
 where
+    E: Rng + Spawner + Metrics + Clock + GClock + Storage,
     P: PublicKey,
     B: Block<Digest = H::Digest, Commitment = H::Digest>,
     H: Hasher,
@@ -45,30 +74,50 @@ where
     /// [`Read`] configuration for the block type.
     block_codec_cfg: B::Cfg,
 
-    /// A map of coding commitments to block digests.
-    ///
-    /// TODO: This map has no durability nor pruning; just for testing / getting things working...
-    commitment_map: HashMap<B::Commitment, B::Digest>,
+    /// Map of block digests -> coding commitments.
+    commitment_map: prunable::Archive<TwoCap, E, H::Digest, H::Digest>,
 
-    /// A map of block digest to reconstructed blocks.
-    ///
-    /// TODO: This map has no durability nor pruning; just for testing / getting things working...
-    reconstruction_cache: HashMap<B::Digest, B>,
+    /// Map of coding commitments -> block digests.
+    digest_map: prunable::Archive<TwoCap, E, H::Digest, H::Digest>,
 }
 
-impl<P, B, H> ShardLayer<P, B, H>
+impl<E, P, B, H> ShardLayer<E, P, B, H>
 where
+    E: Rng + Spawner + Metrics + Clock + GClock + Storage,
     P: PublicKey,
     B: Block<Digest = H::Digest, Commitment = H::Digest> + Debug,
     H: Hasher,
 {
     /// Create a new [ShardLayer] with the given buffered mailbox.
-    pub fn new(mailbox: buffered::Mailbox<P, Shard<B, H>>, cfg: B::Cfg) -> Self {
+    pub async fn init(
+        context: E,
+        cfg: Config,
+        mailbox: buffered::Mailbox<P, Shard<B, H>>,
+        block_codec_cfg: B::Cfg,
+    ) -> Self {
+        let cfg = |name: &str| prunable::Config {
+            partition: format!("shard-layer-{}-{name}-map", cfg.partition_prefix),
+            translator: TwoCap,
+            items_per_section: cfg.items_per_section,
+            compression: None,
+            codec_config: (),
+            buffer_pool: cfg.buffer_pool.clone(),
+            replay_buffer: cfg.replay_buffer,
+            write_buffer: cfg.write_buffer,
+        };
+        let commitment_map =
+            prunable::Archive::init(context.with_label("commitment-map"), cfg("commitment"))
+                .await
+                .unwrap_or_else(|_| panic!("Failed to initialize commitment archive"));
+        let digest_map = prunable::Archive::init(context.with_label("digest-map"), cfg("digest"))
+            .await
+            .unwrap_or_else(|_| panic!("Failed to initialize digest archive"));
+
         Self {
             mailbox,
-            block_codec_cfg: cfg,
-            commitment_map: HashMap::new(),
-            reconstruction_cache: HashMap::new(),
+            block_codec_cfg,
+            commitment_map,
+            digest_map,
         }
     }
 
@@ -81,7 +130,7 @@ where
     ) {
         for (peer, chunk) in chunks {
             let message = Shard::new(coding_commitment, config, chunk);
-            let _peers = self.broadcast(Recipients::One(peer), message).await;
+            let _peers = self.mailbox.broadcast(Recipients::One(peer), message).await;
         }
     }
 
@@ -92,23 +141,8 @@ where
         let available_shards = self.mailbox.get(None, commitment, None).await;
 
         for shard in available_shards {
-            let _peers = self.broadcast(Recipients::All, shard).await;
+            let _peers = self.mailbox.broadcast(Recipients::All, shard).await;
         }
-    }
-
-    /// Attempts to fetch a cached reconstructed [Block] by its digest.
-    pub fn get(&mut self, digest: B::Digest) -> Option<B> {
-        self.reconstruction_cache.get(&digest).cloned()
-    }
-
-    /// Checks if the shard layer has the digest corresponding to a given coding commitment.
-    pub fn has_digest(&self, commitment: &B::Commitment) -> bool {
-        self.commitment_map.contains_key(commitment)
-    }
-
-    /// Gets the digest corresponding to a given coding commitment, if known.
-    pub fn get_digest(&self, commitment: &B::Commitment) -> Option<B::Digest> {
-        self.commitment_map.get(commitment).copied()
     }
 
     /// Attempts to retrieve and reconstruct a [Block] by its coding commitment from a set of [Shard]s
@@ -121,12 +155,12 @@ where
     pub async fn try_reconstruct(
         &mut self,
         commitment: B::Commitment,
-    ) -> Result<(), ReconstructionError> {
+    ) -> Result<Option<B>, ReconstructionError> {
         let available_chunks = self.mailbox.get(None, commitment, None).await;
 
         let Some((total, min)) = available_chunks.first().map(|c| c.config) else {
             // No chunks available.
-            return Ok(());
+            return Ok(None);
         };
         let coded_chunks = available_chunks
             .iter()
@@ -142,7 +176,7 @@ where
                 need = min,
                 "not enough chunks to reconstruct block",
             );
-            return Ok(());
+            return Ok(None);
         }
 
         // Attempt to recover the block from the available chunks. This process will also
@@ -152,13 +186,18 @@ where
         // Attempt to decode the block from the recovered data.
         let block = B::decode_cfg(&mut recovered.as_slice(), &self.block_codec_cfg)?;
 
-        // ---- DEBUG ----
-        info!(%commitment, ?block, "successfully reconstructed block");
-        self.commitment_map.insert(commitment, block.digest());
-        self.reconstruction_cache.insert(block.digest(), block);
-        // ----
+        self.commitment_map
+            .put(block.height(), commitment, block.digest())
+            .await
+            .expect("failed to put commitment");
+        self.digest_map
+            .put(block.height(), block.digest(), commitment)
+            .await
+            .expect("failed to put digest");
 
-        Ok(())
+        info!(%commitment, ?block, "successfully reconstructed block");
+
+        Ok(Some(block))
     }
 
     /// Subscribes to a block by commitment with an externally prepared responder.
@@ -173,25 +212,46 @@ where
     ) -> Result<(), ReconstructionError> {
         todo!("Subscribe to all chunks, reconstruct block when enough are available.");
     }
-}
 
-impl<P, B, H> Broadcaster for ShardLayer<P, B, H>
-where
-    P: PublicKey,
-    B: Block<Digest = H::Digest, Commitment = H::Digest>,
-    H: Hasher,
-{
-    type Recipients = Recipients<P>;
-    type Message = Shard<B, H>;
-    type Response = Vec<P>;
-
-    async fn broadcast(
+    /// Attempts to fetch a reconstructed [Block] by its digest.
+    pub async fn block_by_digest(
         &mut self,
-        recipients: Self::Recipients,
-        message: Self::Message,
-    ) -> oneshot::Receiver<Self::Response> {
-        // Direct broadcasts of individual chunks to the underlying mailbox.
-        self.mailbox.broadcast(recipients, message).await
+        digest: B::Digest,
+    ) -> Result<Option<B>, ReconstructionError> {
+        match self
+            .digest_map
+            .get(Identifier::Key(&digest))
+            .await
+            .expect("failed to get digest")
+        {
+            Some(commitment) => self.try_reconstruct(commitment).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Checks if the shard layer has the digest corresponding to a given coding commitment.
+    pub async fn has_digest(&self, commitment: &B::Commitment) -> bool {
+        self.commitment_map
+            .has(Identifier::Key(commitment))
+            .await
+            .expect("failed to get commitment")
+    }
+
+    /// Gets the digest corresponding to a given coding commitment, if known.
+    pub async fn get_digest(&self, commitment: &B::Commitment) -> Option<B::Digest> {
+        self.commitment_map
+            .get(Identifier::Key(commitment))
+            .await
+            .expect("failed to get commitment")
+    }
+
+    /// Prunes old entries from the internal maps.
+    pub async fn prune(&mut self, up_to: u64) {
+        futures::try_join!(
+            self.commitment_map.prune(up_to),
+            self.digest_map.prune(up_to)
+        )
+        .expect("failed to prune maps");
     }
 }
 

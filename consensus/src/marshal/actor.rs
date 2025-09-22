@@ -246,7 +246,7 @@ impl<
     pub fn start<R>(
         mut self,
         application: impl Reporter<Activity = B>,
-        shards: ShardLayer<P, B, H>,
+        shards: ShardLayer<E, P, B, H>,
         resolver: (mpsc::Receiver<handler::Message<B>>, R),
     ) -> Handle<()>
     where
@@ -259,7 +259,7 @@ impl<
     async fn run<R>(
         mut self,
         application: impl Reporter<Activity = B>,
-        mut shard_layer: ShardLayer<P, B, H>,
+        mut shard_layer: ShardLayer<E, P, B, H>,
         (mut resolver_rx, mut resolver): (mpsc::Receiver<handler::Message<B>>, R),
     ) where
         R: Resolver<Key = handler::Request<B>>,
@@ -327,13 +327,13 @@ impl<
 
                             // Block on waiting for the block to be reconstructed; We cannot move forward without
                             // having the block digest.
-                            while !shard_layer.has_digest(&commitment) {
+                            while !shard_layer.has_digest(&commitment).await {
                                 dbg!("spinning");
                                 shard_layer.try_reconstruct(commitment).await.expect("Reconstruction error not yet handled");
                             }
 
                             // Request the block digest for the block corresponding to the coding commitment.
-                            let digest = shard_layer.get_digest(&commitment).unwrap();
+                            let digest = shard_layer.get_digest(&commitment).await.unwrap();
 
                             // Store notarization by view
                             self.cache.put_notarization(round, digest, notarization.clone()).await;
@@ -362,13 +362,13 @@ impl<
 
                             // Block on waiting for the block to be reconstructed; We cannot move forward without
                             // having the block digest.
-                            while !shard_layer.has_digest(&commitment) {
+                            while !shard_layer.has_digest(&commitment).await {
                                 dbg!("spinning");
                                 shard_layer.try_reconstruct(commitment).await.expect("Reconstruction error not yet handled");
                             }
 
                             // Request the block digest for the block corresponding to the coding commitment.
-                            let digest = shard_layer.get_digest(&commitment).unwrap();
+                            let digest = shard_layer.get_digest(&commitment).await.unwrap();
 
                             self.cache.put_finalization(round, digest, finalization.clone()).await;
 
@@ -465,6 +465,7 @@ impl<
 
                                 // Prune archives
                                 self.cache.prune(prune_round).await;
+                                shard_layer.prune(height).await;
 
                                 // Update the last processed round
                                 let round = finalization.round();
@@ -558,7 +559,7 @@ impl<
 
                                     // Get block
                                     let commitment = notarization.proposal.payload;
-                                    let digest = match shard_layer.get_digest(&commitment) {
+                                    let digest = match shard_layer.get_digest(&commitment).await {
                                         Some(digest) => digest,
                                         None => {
                                             debug!(?commitment, "notarized block missing commitment mapping on request");
@@ -754,11 +755,15 @@ impl<
     /// Looks for a block anywhere in local storage.
     async fn find_block(
         &mut self,
-        shards: &mut ShardLayer<P, B, H>,
+        shards: &mut ShardLayer<E, P, B, H>,
         commitment: B::Commitment,
     ) -> Option<B> {
         // Check shard layer.
-        if let Some(block) = shards.get(commitment) {
+        if let Some(block) = shards
+            .block_by_digest(commitment)
+            .await
+            .expect("reconstruction error not yet handled")
+        {
             return Some(block);
         }
         // Check verified / notarized blocks via cache manager.
