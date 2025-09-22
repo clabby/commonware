@@ -55,13 +55,14 @@ struct BlockSubscription<B: Block> {
 /// finalization for a block that is ahead of its current view, it will request the missing blocks
 /// from its peers. This ensures that the actor can catch up to the rest of the network if it falls
 /// behind.
-pub struct Actor<
+pub struct Actor<B, E, V, P, H>
+where
     B: Block,
     E: Rng + Spawner + Metrics + Clock + GClock + Storage,
     V: Variant,
     P: PublicKey,
     H: Hasher,
-> {
+{
     // ---------- Context ----------
     context: E,
 
@@ -107,13 +108,13 @@ pub struct Actor<
     processed_height: Gauge,
 }
 
-impl<
-        B: Block<Digest = H::Digest, Commitment = H::Digest> + std::fmt::Debug,
-        E: Rng + Spawner + Metrics + Clock + GClock + Storage,
-        V: Variant,
-        P: PublicKey,
-        H: Hasher,
-    > Actor<B, E, V, P, H>
+impl<B, E, V, P, H> Actor<B, E, V, P, H>
+where
+    B: Block<Digest = H::Digest, Commitment = H::Digest> + std::fmt::Debug,
+    E: Rng + Spawner + Metrics + Clock + GClock + Storage,
+    V: Variant,
+    P: PublicKey,
+    H: Hasher,
 {
     /// Create a new application actor.
     pub async fn init(context: E, config: Config<V, B>) -> (Self, Mailbox<V, B, P, H>) {
@@ -429,12 +430,13 @@ impl<
                             let block = self.get_finalized_block(height).await;
                             result.send(block).unwrap_or_else(|_| warn!(?height, "Failed to send block to orchestrator"));
                         }
-                        Orchestration::Processed { height, digest } => {
+                        Orchestration::Processed { height, digest, commitment } => {
                             // Update metrics
                             self.processed_height.set(height as i64);
 
                             // Cancel any outstanding requests (by height and by digest)
-                            resolver.cancel(Request::<B>::Block(digest)).await;
+                            resolver.cancel(Request::<B>::Block(commitment)).await;
+                            resolver.cancel(Request::<B>::CodingCommitment { height, digest }).await;
                             resolver.retain(Request::<B>::Finalized { height }.predicate()).await;
 
                             // If finalization exists, prune the archives
@@ -471,9 +473,9 @@ impl<
 
                             // Iterate backwards, repairing blocks as we go.
                             while cursor.height() > height {
-                                let commitment = cursor.parent();
-                                let Some(commitment) = shard_layer.get_digest(&commitment).await else {
-                                    dbg!("Missing block digest");
+                                let digest = cursor.parent();
+                                let Some(commitment) = shard_layer.get_commitment(&digest).await else {
+                                    resolver.fetch(Request::<B>::CodingCommitment { digest, height: cursor.height().saturating_sub(1) }).await;
                                     break;
                                 };
 
@@ -518,6 +520,14 @@ impl<
                                         continue;
                                     };
                                     let _ = response.send(block.encode().into());
+                                }
+                                Request::CodingCommitment { digest, .. } => {
+                                    // Check for coding commitment locally
+                                    let Some(commitment) = shard_layer.get_commitment(&digest).await else {
+                                        debug!(?digest, "coding commitment missing on request");
+                                        continue;
+                                    };
+                                    let _ = response.send(commitment.encode().into());
                                 }
                                 Request::Finalized { height } => {
                                     // Get finalization
@@ -572,6 +582,24 @@ impl<
                                     let finalization = self.cache.get_finalization_for(commitment).await;
                                     self.finalize(height, commitment, block, finalization, &mut notifier_tx).await;
                                     debug!(?commitment, height, "received block");
+                                    let _ = response.send(true);
+                                },
+                                Request::CodingCommitment { digest, height } => {
+                                    // Parse block digest and height
+                                    let Ok(commitment) = B::Commitment::decode_cfg(value.as_ref(), &()) else {
+                                        let _ = response.send(false);
+                                        continue;
+                                    };
+
+                                    // Persist the commitment.
+                                    shard_layer.put_commitment(height, digest, commitment).await;
+
+                                    // If we have the block, persist it and its finalization.
+                                    if let Some(block) = self.find_block(&mut shard_layer, commitment).await {
+                                        let finalization = self.cache.get_finalization_for(commitment).await;
+                                        self.finalize(block.height(), commitment, block.clone(), finalization, &mut notifier_tx).await;
+                                    }
+
                                     let _ = response.send(true);
                                 },
                                 Request::Finalized { height } => {

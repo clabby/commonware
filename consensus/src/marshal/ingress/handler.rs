@@ -15,8 +15,9 @@ use tracing::error;
 
 /// The subject of a backfill request.
 const BLOCK_REQUEST: u8 = 0;
-const FINALIZED_REQUEST: u8 = 1;
-const NOTARIZED_REQUEST: u8 = 2;
+const CODING_COMMITMENT_REQUEST: u8 = 1;
+const FINALIZED_REQUEST: u8 = 2;
+const NOTARIZED_REQUEST: u8 = 3;
 
 /// Messages sent from the resolver's [Consumer]/[Producer] implementation
 /// to the marshal [Actor](super::super::actor::Actor).
@@ -104,6 +105,7 @@ impl<B: Block> Producer for Handler<B> {
 #[derive(Clone)]
 pub enum Request<B: Block> {
     Block(B::Commitment),
+    CodingCommitment { digest: B::Digest, height: u64 },
     Finalized { height: u64 },
     Notarized { round: Round },
 }
@@ -113,6 +115,7 @@ impl<B: Block> Request<B> {
     fn subject(&self) -> u8 {
         match self {
             Self::Block(_) => BLOCK_REQUEST,
+            Self::CodingCommitment { .. } => CODING_COMMITMENT_REQUEST,
             Self::Finalized { .. } => FINALIZED_REQUEST,
             Self::Notarized { .. } => NOTARIZED_REQUEST,
         }
@@ -126,6 +129,9 @@ impl<B: Block> Request<B> {
         let cloned = self.clone();
         move |s| match (&cloned, &s) {
             (Self::Block(_), _) => unreachable!("we should never retain by block"),
+            (Self::CodingCommitment { .. }, _) => {
+                unreachable!("we should never retain by coding commitment")
+            }
             (Self::Finalized { height: mine }, Self::Finalized { height: theirs }) => {
                 *theirs > *mine
             }
@@ -140,7 +146,11 @@ impl<B: Block> Write for Request<B> {
     fn write(&self, buf: &mut impl BufMut) {
         self.subject().write(buf);
         match self {
-            Self::Block(commitment) => commitment.write(buf),
+            Self::Block(digest) => digest.write(buf),
+            Self::CodingCommitment { digest, height } => {
+                digest.write(buf);
+                height.write(buf);
+            }
             Self::Finalized { height } => height.write(buf),
             Self::Notarized { round } => round.write(buf),
         }
@@ -153,6 +163,10 @@ impl<B: Block> Read for Request<B> {
     fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
         let request = match u8::read(buf)? {
             BLOCK_REQUEST => Self::Block(B::Commitment::read(buf)?),
+            CODING_COMMITMENT_REQUEST => Self::CodingCommitment {
+                digest: B::Digest::read(buf)?,
+                height: u64::read(buf)?,
+            },
             FINALIZED_REQUEST => Self::Finalized {
                 height: u64::read(buf)?,
             },
@@ -168,7 +182,10 @@ impl<B: Block> Read for Request<B> {
 impl<B: Block> EncodeSize for Request<B> {
     fn encode_size(&self) -> usize {
         1 + match self {
-            Self::Block(block) => block.encode_size(),
+            Self::Block(commitment) => commitment.encode_size(),
+            Self::CodingCommitment { digest, height } => {
+                digest.encode_size() + height.encode_size()
+            }
             Self::Finalized { height } => height.encode_size(),
             Self::Notarized { round } => round.encode_size(),
         }
@@ -181,6 +198,16 @@ impl<B: Block> PartialEq for Request<B> {
     fn eq(&self, other: &Self) -> bool {
         match (&self, &other) {
             (Self::Block(a), Self::Block(b)) => a == b,
+            (
+                Self::CodingCommitment {
+                    digest: digest_a,
+                    height: height_a,
+                },
+                Self::CodingCommitment {
+                    digest: digest_b,
+                    height: height_b,
+                },
+            ) => digest_a == digest_b && height_a == height_b,
             (Self::Finalized { height: a }, Self::Finalized { height: b }) => a == b,
             (Self::Notarized { round: a }, Self::Notarized { round: b }) => a == b,
             _ => false,
@@ -194,6 +221,16 @@ impl<B: Block> Ord for Request<B> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (&self, &other) {
             (Self::Block(a), Self::Block(b)) => a.cmp(b),
+            (
+                Self::CodingCommitment {
+                    digest: digest_a,
+                    height: height_a,
+                },
+                Self::CodingCommitment {
+                    digest: digest_b,
+                    height: height_b,
+                },
+            ) => height_a.cmp(height_b).then(digest_a.cmp(digest_b)),
             (Self::Finalized { height: a }, Self::Finalized { height: b }) => a.cmp(b),
             (Self::Notarized { round: a }, Self::Notarized { round: b }) => a.cmp(b),
             (a, b) => a.subject().cmp(&b.subject()),
@@ -211,6 +248,10 @@ impl<B: Block> Hash for Request<B> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
             Self::Block(commitment) => commitment.hash(state),
+            Self::CodingCommitment { digest, height } => {
+                digest.hash(state);
+                height.hash(state);
+            }
             Self::Finalized { height } => height.hash(state),
             Self::Notarized { round } => round.hash(state),
         }
@@ -221,6 +262,9 @@ impl<B: Block> Display for Request<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Block(commitment) => write!(f, "Block({commitment:?})"),
+            Self::CodingCommitment { digest, height } => {
+                write!(f, "BlockDigest({digest:?}, {height})")
+            }
             Self::Finalized { height } => write!(f, "Finalized({height:?})"),
             Self::Notarized { round } => write!(f, "Notarized({round:?})"),
         }
@@ -231,6 +275,9 @@ impl<B: Block> Debug for Request<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Block(commitment) => write!(f, "Block({commitment:?})"),
+            Self::CodingCommitment { digest, height } => {
+                write!(f, "BlockCommitment({digest:?}, {height})")
+            }
             Self::Finalized { height } => write!(f, "Finalized({height:?})"),
             Self::Notarized { round } => write!(f, "Notarized({round:?})"),
         }

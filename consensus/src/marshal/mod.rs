@@ -62,7 +62,6 @@ pub mod finalizer;
 pub use finalizer::Finalizer;
 pub mod ingress;
 pub use ingress::mailbox::Mailbox;
-pub mod envelope;
 pub mod resolver;
 
 #[cfg(test)]
@@ -77,10 +76,7 @@ mod tests {
         resolver::p2p as resolver,
     };
     use crate::{
-        marshal::{
-            envelope::CodedBlock,
-            ingress::coding::{self, ShardLayer},
-        },
+        marshal::ingress::coding::{self, CodedBlock, ShardLayer},
         threshold_simplex::types::{
             finalize_namespace, notarize_namespace, seed_namespace, Activity, Finalization,
             Finalize, Notarization, Notarize, Proposal,
@@ -103,7 +99,7 @@ mod tests {
         },
         ed25519::{PrivateKey, PublicKey},
         sha256::Sha256,
-        Committable, Digestible, Hasher, PrivateKeyExt as _, Signer as _,
+        Digestible, Hasher, PrivateKeyExt as _, Signer as _,
     };
     use commonware_macros::test_traced;
     use commonware_p2p::{
