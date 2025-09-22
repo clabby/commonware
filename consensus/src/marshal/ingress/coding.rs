@@ -126,14 +126,21 @@ where
         }
     }
 
-    /// Broadcasts the local [Shard] of a block to all peers.
-    ///
-    /// TODO: This should only send out the shard that was assigned to the local validator.
-    pub async fn try_broadcast_mine(&mut self, commitment: B::Commitment) {
-        let available_shards = self.mailbox.get(None, commitment, None).await;
+    /// Broadcasts a local [Shard] of a block to all peers, if the shard is present.
+    pub async fn try_broadcast_shard(&mut self, commitment: B::Commitment, index: u16) {
+        let shard = self
+            .mailbox
+            .get(None, commitment, None)
+            .await
+            .iter()
+            .find(|c| c.chunk.index == index)
+            .cloned();
 
-        for shard in available_shards {
+        if let Some(shard) = shard {
+            debug!(%commitment, index, "broadcasted local shard to all peers");
             let _peers = self.mailbox.broadcast(Recipients::All, shard).await;
+        } else {
+            debug!(%commitment, index, "no local shard to broadcast" );
         }
     }
 
@@ -178,10 +185,20 @@ where
         // Attempt to decode the block from the recovered data.
         let block = B::decode_cfg(&mut recovered.as_slice(), &self.block_codec_cfg)?;
 
-        self.put_commitment(block.height(), block.digest(), commitment)
-            .await;
+        // Persist the digest -> commitment mapping for future lookups.
+        //
+        // SAFETY: We just verified the block's integrity by reconstructing it from the chunks.
+        unsafe {
+            self.put_commitment(block.height(), block.digest(), commitment)
+                .await;
+        }
 
-        info!(%commitment, ?block, "successfully reconstructed block");
+        info!(
+            %commitment,
+            digest = %block.digest(),
+            height = block.height(),
+            "successfully reconstructed block"
+        );
 
         Ok(Some(block))
     }
@@ -196,11 +213,16 @@ where
         _commitment: B::Commitment,
         _responder: oneshot::Sender<B>,
     ) -> Result<(), ReconstructionError> {
-        todo!("Subscribe to all chunks, reconstruct block when enough are available.");
+        todo!("Create subscription");
     }
 
     /// Puts a coding commitment in the store, keyed by digest and block height.
-    pub async fn put_commitment(
+    ///
+    /// # Safety
+    ///
+    /// Callers of this function must ensure that the provided commitment is correct for the
+    /// block with the given height and digest.
+    pub async unsafe fn put_commitment(
         &mut self,
         height: u64,
         digest: B::Digest,

@@ -315,12 +315,9 @@ where
                             self.cache_verified(round, block.commitment(), block).await;
                         }
                         Message::Notarize { notarization } => {
-                            // DEBUG - For initial testing, we just send out _all_ of our chunks for the commitment,
-                            // to side-step self-identification.
-                            //
-                            // We should just be sending out the chunk that was sent to us by the proposer for perf.
                             let commitment = notarization.proposal.payload;
-                            shard_layer.try_broadcast_mine(commitment).await;
+                            let index = notarization.proposal_signature.index as u16;
+                            shard_layer.try_broadcast_shard(commitment, index).await;
                         }
                         Message::Notarization { notarization } => {
                             let round = notarization.round();
@@ -339,12 +336,9 @@ where
                             }
                         }
                         Message::Finalize { finalization } => {
-                            // DEBUG - For initial testing, we just send out _all_ of our chunks for the commitment,
-                            // to side-step self-identification.
-                            //
-                            // We should just be sending out the chunk that was sent to us by the proposer for perf.
                             let commitment = finalization.proposal.payload;
-                            shard_layer.try_broadcast_mine(commitment).await;
+                            let index = finalization.proposal_signature.index as u16;
+                            shard_layer.try_broadcast_shard(commitment, index).await;
                         }
                         Message::Finalization { finalization } => {
                             // Cache finalization by round
@@ -592,7 +586,13 @@ where
                                     };
 
                                     // Persist the commitment.
-                                    shard_layer.put_commitment(height, digest, commitment).await;
+                                    //
+                                    // This operation is unsafe at the moment; we trust our peer sent us the correct
+                                    // commitment for the given digest. We should instead ask for the erasure coded
+                                    // chunks and reproduce the commitment ourselves.
+                                    unsafe {
+                                        shard_layer.put_commitment(height, digest, commitment).await;
+                                    }
 
                                     // If we have the block, persist it and its finalization.
                                     if let Some(block) = self.find_block(&mut shard_layer, commitment).await {
