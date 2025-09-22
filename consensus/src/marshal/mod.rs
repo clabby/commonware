@@ -63,6 +63,7 @@ pub use finalizer::Finalizer;
 pub mod ingress;
 pub use ingress::mailbox::Mailbox;
 pub mod resolver;
+pub mod envelope;
 
 #[cfg(test)]
 pub mod mocks;
