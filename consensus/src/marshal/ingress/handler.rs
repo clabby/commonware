@@ -315,13 +315,30 @@ mod tests {
     }
 
     #[test]
+    fn test_subject_coding_commitment_encoding() {
+        let digest = Sha256::hash(b"test");
+        let request = Request::<B>::CodingCommitment { digest, height: 1 };
+
+        // Test encoding
+        let encoded = request.encode();
+        assert_eq!(encoded.len(), 41); // 1 byte for enum variant + 32 bytes for digest + 8 bytes for height
+        assert_eq!(encoded[0], 1);
+
+        // Test decoding
+        let mut buf = encoded.as_ref();
+        let decoded = Request::<B>::read(&mut buf).unwrap();
+        assert_eq!(request, decoded);
+        assert_eq!(decoded, Request::CodingCommitment { digest, height: 1 });
+    }
+
+    #[test]
     fn test_subject_finalized_encoding() {
         let height = 12345u64;
         let request = Request::<B>::Finalized { height };
 
         // Test encoding
         let encoded = request.encode();
-        assert_eq!(encoded[0], 1); // Finalized variant
+        assert_eq!(encoded[0], 2); // Finalized variant
 
         // Test decoding
         let mut buf = encoded.as_ref();
@@ -337,7 +354,7 @@ mod tests {
 
         // Test encoding
         let encoded = request.encode();
-        assert_eq!(encoded[0], 2); // Notarized variant
+        assert_eq!(encoded[0], 3); // Notarized variant
 
         // Test decoding
         let mut buf = encoded.as_ref();
