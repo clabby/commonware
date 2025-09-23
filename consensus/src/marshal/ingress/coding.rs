@@ -582,7 +582,7 @@ mod test {
     }
 
     #[test]
-    fn test_codec_roundtrip() {
+    fn test_coded_block_codec_roundtrip() {
         const MOCK_BLOCK_DATA: &[u8] = b"commonware bit twiddling club";
         const CONFIG: (u16, u16) = (4, 2);
 

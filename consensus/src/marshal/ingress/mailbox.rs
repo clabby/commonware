@@ -52,13 +52,6 @@ pub(crate) enum Message<V: Variant, B: Block, P: PublicKey, H: Hasher> {
         /// The chunks and their corresponding participants.
         chunks: Vec<(P, Chunk<H>)>,
     },
-    /// A notification that a block has been verified by the application.
-    Verified {
-        /// The round in which the block was verified.
-        round: Round,
-        /// The verified block.
-        block: B,
-    },
 
     // -------------------- Consensus Engine Messages --------------------
     /// A single notarize vote from the consensus engine.
@@ -191,18 +184,6 @@ impl<V: Variant, B: Block, P: PublicKey, H: Hasher> Mailbox<V, B, P, H> {
             .is_err()
         {
             error!("failed to send broadcast message to actor: receiver dropped");
-        }
-    }
-
-    /// Notifies the actor that a block has been verified.
-    pub async fn verified(&mut self, round: Round, block: B) {
-        if self
-            .sender
-            .send(Message::Verified { round, block })
-            .await
-            .is_err()
-        {
-            error!("failed to send verified message to actor: receiver dropped");
         }
     }
 }
