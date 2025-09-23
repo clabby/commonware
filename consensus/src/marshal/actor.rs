@@ -15,6 +15,7 @@ use crate::{
     Block, Reporter,
 };
 use commonware_codec::{Decode, Encode};
+use commonware_coding::reed_solomon::Chunk;
 use commonware_cryptography::{bls12381::primitives::variant::Variant, Hasher, PublicKey};
 use commonware_macros::select;
 use commonware_resolver::Resolver;
@@ -37,9 +38,17 @@ use tracing::{debug, info, warn};
 
 /// A struct that holds multiple subscriptions for a block.
 struct BlockSubscription<B: Block> {
-    // The subscribers that are waiting for the block
+    /// The subscribers that are waiting for the block
     subscribers: Vec<oneshot::Sender<B>>,
-    // Aborter that aborts the waiter future when dropped
+    /// Aborter that aborts the waiter future when dropped
+    _aborter: Aborter,
+}
+
+/// A struct that holds multiple subscriptions for a chunk.
+struct ChunkSubscription<H: Hasher> {
+    /// The subscribers that are waiting for the chunk
+    subscribers: Vec<oneshot::Sender<Chunk<H>>>,
+    /// Aborter that aborts the waiter future when dropped
     _aborter: Aborter,
 }
 
@@ -92,6 +101,8 @@ where
 
     // Outstanding subscriptions for blocks
     block_subscriptions: BTreeMap<B::Commitment, BlockSubscription<B>>,
+    // Outstanding subscriptions for chunks
+    chunk_subscriptions: BTreeMap<B::Commitment, ChunkSubscription<H>>,
 
     // ---------- Storage ----------
     // Prunable cache
@@ -232,6 +243,7 @@ where
                 codec_config: config.codec_config,
                 last_processed_round: Round::new(0, 0),
                 block_subscriptions: BTreeMap::new(),
+                chunk_subscriptions: BTreeMap::new(),
                 cache,
                 finalizations_by_height,
                 finalized_blocks,
@@ -282,7 +294,8 @@ where
             .spawn(|_| finalizer.run());
 
         // Create a local pool for waiter futures
-        let mut waiters = AbortablePool::<(B::Commitment, B)>::default();
+        let mut block_waiters = AbortablePool::<(B::Commitment, B)>::default();
+        let mut chunk_waiters = AbortablePool::<((B::Commitment, u16), Chunk<H>)>::default();
 
         // Handle messages
         loop {
@@ -291,11 +304,15 @@ where
                 bs.subscribers.retain(|tx| !tx.is_canceled());
                 !bs.subscribers.is_empty()
             });
+            self.chunk_subscriptions.retain(|_, cs| {
+                cs.subscribers.retain(|tx| !tx.is_canceled());
+                !cs.subscribers.is_empty()
+            });
 
             // Select messages
             select! {
                 // Handle waiter completions first
-                result = waiters.next_completed() => {
+                result = block_waiters.next_completed() => {
                     let Ok((commitment, block)) = result else {
                         continue; // Aborted future
                     };
@@ -364,6 +381,24 @@ where
                             let result = self.find_block(&mut shard_layer, commitment).await;
                             let _ = response.send(result);
                         }
+                        Message::SubscribeChunk { commitment, index, response } => {
+                            match self.chunk_subscriptions.entry(commitment) {
+                                Entry::Occupied(mut entry) => {
+                                    entry.get_mut().subscribers.push(response);
+                                }
+                                Entry::Vacant(entry) => {
+                                    let (tx, rx) = oneshot::channel();
+                                    shard_layer.subscribe_chunk(commitment, index, tx).await;
+                                    let aborter = chunk_waiters.push(async move {
+                                        ((commitment, index), rx.await.expect("shard subscriber closed"))
+                                    });
+                                    entry.insert(ChunkSubscription {
+                                        subscribers: vec![response],
+                                        _aborter: aborter,
+                                    });
+                                }
+                            }
+                        }
                         Message::Subscribe { round, commitment, response } => {
                             // Check for block locally
                             if let Some(block) = self.find_block(&mut shard_layer, commitment).await {
@@ -399,8 +434,8 @@ where
                                 }
                                 Entry::Vacant(entry) => {
                                     let (tx, rx) = oneshot::channel();
-                                    shard_layer.subscribe_prepared(commitment, tx).await.unwrap();
-                                    let aborter = waiters.push(async move {
+                                    shard_layer.subscribe_block(commitment, tx).await.expect("Reconstruction error not yet handled");
+                                    let aborter = block_waiters.push(async move {
                                         (commitment, rx.await.expect("shard subscriber closed"))
                                     });
                                     entry.insert(BlockSubscription {
@@ -469,7 +504,10 @@ where
                             while cursor.height() > height {
                                 let digest = cursor.parent();
                                 let Some(commitment) = shard_layer.get_commitment(&digest).await else {
-                                    resolver.fetch(Request::<B>::CodingCommitment { digest, height: cursor.height().saturating_sub(1) }).await;
+                                    resolver.fetch(Request::<B>::CodingCommitment {
+                                        digest,
+                                        height: cursor.height().saturating_sub(1)
+                                    }).await;
                                     break;
                                 };
 

@@ -22,6 +22,7 @@ use futures::channel::oneshot;
 use governor::clock::Clock as GClock;
 use rand::Rng;
 use std::{
+    collections::{btree_map::Entry, BTreeMap},
     fmt::Debug,
     num::{NonZero, NonZeroUsize},
     ops::Deref,
@@ -59,6 +60,16 @@ pub struct Config {
     pub buffer_pool: PoolRef,
 }
 
+/// A subscription for a block by its commitment.
+struct BlockSubscription<B: Block> {
+    subscribers: Vec<oneshot::Sender<B>>,
+}
+
+/// A subscription for a chunk by its commitment and index.
+struct ChunkSubscription<H: Hasher> {
+    subscribers: Vec<oneshot::Sender<Chunk<H>>>,
+}
+
 /// A layer that handles receiving erasure coded [Block]s from the [Actor](super::super::actor::Actor),
 /// broadcasting them to peers, and reassembling them from received [Shard]s.
 pub struct ShardLayer<E, P, B, H>
@@ -76,6 +87,12 @@ where
 
     /// Map of block digests -> coding commitments.
     digest_map: prunable::Archive<TwoCap, E, H::Digest, H::Digest>,
+
+    /// Open subscriptions for blocks by commitment.
+    block_subscriptions: BTreeMap<B::Commitment, BlockSubscription<B>>,
+
+    /// Open subscriptions for chunks by commitment and index.
+    chunk_subscriptions: BTreeMap<(B::Commitment, u16), ChunkSubscription<H>>,
 }
 
 impl<E, P, B, H> ShardLayer<E, P, B, H>
@@ -110,6 +127,8 @@ where
             mailbox,
             block_codec_cfg,
             digest_map,
+            block_subscriptions: BTreeMap::new(),
+            chunk_subscriptions: BTreeMap::new(),
         }
     }
 
@@ -167,6 +186,15 @@ where
             .map(|c| c.chunk)
             .collect::<Vec<_>>();
 
+        // Attempt to resolve any open subscriptions for the chunks we have.
+        for chunk in coded_chunks.iter() {
+            if let Some(mut subs) = self.chunk_subscriptions.remove(&(commitment, chunk.index)) {
+                for sub in subs.subscribers.drain(..) {
+                    let _ = sub.send(chunk.clone());
+                }
+            }
+        }
+
         if coded_chunks.len() < min as usize {
             // Not enough chunks to recover the block yet.
             debug!(
@@ -193,6 +221,13 @@ where
                 .await;
         }
 
+        // Attempt to resolve any open subscriptions for this block.
+        if let Some(mut subs) = self.block_subscriptions.remove(&commitment) {
+            for sub in subs.subscribers.drain(..) {
+                let _ = sub.send(block.clone());
+            }
+        }
+
         info!(
             %commitment,
             digest = %block.digest(),
@@ -205,15 +240,59 @@ where
 
     /// Subscribes to a block by commitment with an externally prepared responder.
     ///
-    /// The responder will be sent the first message for a commitment when it is available; either
-    /// instantly (if cached) or when it is received from the network. The request can be canceled
-    /// by dropping the responder.
-    pub async fn subscribe_prepared(
+    /// The responder will be sent the block when it is available; either instantly (if cached)
+    /// or when it is received from the network. The request can be canceled by dropping the
+    /// responder.
+    pub async fn subscribe_block(
         &mut self,
-        _commitment: B::Commitment,
-        _responder: oneshot::Sender<B>,
+        commitment: B::Commitment,
+        responder: oneshot::Sender<B>,
     ) -> Result<(), ReconstructionError> {
-        todo!("Create subscription");
+        match self.block_subscriptions.entry(commitment) {
+            Entry::Vacant(entry) => {
+                entry.insert(BlockSubscription {
+                    subscribers: vec![responder],
+                });
+            }
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().subscribers.push(responder);
+            }
+        }
+
+        // Try to reconstruct the block immediately in case we already have enough chunks.
+        self.try_reconstruct(commitment).await?;
+
+        Ok(())
+    }
+
+    /// Subscribes to a chunk by commitment and index with an externally prepared responder.
+    ///
+    /// The responder will be sent the chunk when it is available; either instantly (if cached)
+    /// or when it is received from the network. The request can be canceled by dropping the
+    /// responder.
+    pub async fn subscribe_chunk(
+        &mut self,
+        commitment: B::Commitment,
+        index: u16,
+        responder: oneshot::Sender<Chunk<H>>,
+    ) {
+        let available_chunks = self.mailbox.get(None, commitment, None).await;
+
+        if let Some(shard) = available_chunks.iter().find(|s| s.chunk.index == index) {
+            let _ = responder.send(shard.chunk.clone());
+            return;
+        }
+
+        match self.chunk_subscriptions.entry((commitment, index)) {
+            Entry::Vacant(entry) => {
+                entry.insert(ChunkSubscription {
+                    subscribers: vec![responder],
+                });
+            }
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().subscribers.push(responder);
+            }
+        }
     }
 
     /// Puts a coding commitment in the store, keyed by digest and block height.

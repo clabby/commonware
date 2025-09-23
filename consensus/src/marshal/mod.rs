@@ -377,7 +377,7 @@ mod tests {
         }
     }
 
-    #[test_traced("WARN")]
+    #[test_traced("DEBUG")]
     fn test_finalize_bad_links() {
         for seed in 0..5 {
             let result1 = finalize(seed, UNRELIABLE_LINK);
@@ -467,6 +467,10 @@ mod tests {
                         .report(Activity::Notarize(notarization_vote.clone()))
                         .await;
                 }
+
+                // Wait for the block chunks to be delivered; Before making a notarization,
+                // the chunks must be present.
+                context.sleep(link.latency + link.jitter).await;
 
                 // Notarize block by the validator that broadcasted it
                 let notarization = make_notarization(proposal.clone(), &shares, QUORUM);
@@ -623,9 +627,6 @@ mod tests {
             let (commitment1, config1, chunks1) = shard(&block1, &peers);
             let (commitment2, config2, chunks2) = shard(&block2, &peers);
 
-            actor.broadcast(commitment1, config1, chunks1).await;
-            actor.broadcast(commitment2, config2, chunks2).await;
-
             let sub1_rx = actor
                 .subscribe(Some(Round::from((0, 1))), commitment1)
                 .await;
@@ -635,6 +636,9 @@ mod tests {
             let sub3_rx = actor
                 .subscribe(Some(Round::from((0, 1))), commitment1)
                 .await;
+
+            actor.broadcast(commitment1, config1, chunks1).await;
+            actor.broadcast(commitment2, config2, chunks2).await;
 
             for (view, block) in [(1, block1.clone()), (2, block2.clone())] {
                 let proposal = Proposal {

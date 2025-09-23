@@ -24,15 +24,26 @@ pub(crate) enum Message<V: Variant, B: Block, P: PublicKey, H: Hasher> {
         /// A channel to send the retrieved block.
         response: oneshot::Sender<Option<B>>,
     },
-    /// A request to retrieve a block by its digest.
+    /// A request to retrieve a block by its commitment.
+    ///
+    /// TODO: For a cleaner API, we should have this be retrieve-by-digest.
     Subscribe {
         /// The view in which the block was notarized. This is an optimization
         /// to help locate the block.
         round: Option<Round>,
-        /// The digest of the block to retrieve.
+        /// The coding commitment of the block to retrieve.
         commitment: B::Commitment,
         /// A channel to send the retrieved block.
         response: oneshot::Sender<B>,
+    },
+    /// A request to retrieve an erasure coded chunk by its commitment and index.
+    SubscribeChunk {
+        /// The commitment of the chunk to retrieve.
+        commitment: B::Commitment,
+        /// The index of the chunk to retrieve.
+        index: u16,
+        /// A channel to send the retrieved chunk.
+        response: oneshot::Sender<Chunk<H>>,
     },
     /// A request to broadcast an erasure coded block to all peers.
     Broadcast {
@@ -130,6 +141,36 @@ impl<V: Variant, B: Block, P: PublicKey, H: Hasher> Mailbox<V, B, P, H> {
             .is_err()
         {
             error!("failed to send subscribe message to actor: receiver dropped");
+        }
+        rx
+    }
+
+    /// Subscribe chunk is a request to receive an erasure coded chunk by its commitment and index.
+    ///
+    /// If the chunk is found available locally, the chunk will be returned immediately.
+    ///
+    /// If the chunk is not available locally, the request will be registered and the caller will
+    /// be notified when the chunk is available. If the chunk is not part of a finalized block, it's
+    /// possible that it may never become available.
+    ///
+    /// The oneshot receiver should be dropped to cancel the subscription.
+    pub async fn subscribe_chunk(
+        &mut self,
+        commitment: B::Commitment,
+        index: u16,
+    ) -> oneshot::Receiver<Chunk<H>> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(Message::SubscribeChunk {
+                commitment,
+                index,
+                response: tx,
+            })
+            .await
+            .is_err()
+        {
+            error!("failed to send subscribe chunk message to actor: receiver dropped");
         }
         rx
     }
