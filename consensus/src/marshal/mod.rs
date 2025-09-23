@@ -76,10 +76,10 @@ mod tests {
         resolver::p2p as resolver,
     };
     use crate::{
-        marshal::ingress::coding::{self, CodedBlock, ShardLayer},
+        marshal::ingress::coding::{CodedBlock, ShardLayer},
         threshold_simplex::types::{
             finalize_namespace, notarize_namespace, seed_namespace, Activity, Finalization,
-            Finalize, Notarization, Notarize, Proposal,
+            Notarization, Notarize, Proposal,
         },
         types::Round,
         Block as _, Reporter,
@@ -110,10 +110,10 @@ mod tests {
     use commonware_runtime::{buffer::PoolRef, deterministic, Clock, Metrics, Runner};
     use commonware_utils::{NZUsize, NZU64};
     use governor::Quota;
-    use rand::{seq::SliceRandom, Rng};
+    use rand::Rng;
     use std::{
         collections::BTreeMap,
-        num::{NonZero, NonZeroU32, NonZeroUsize},
+        num::{NonZeroU32, NonZeroUsize},
         time::Duration,
     };
 
@@ -203,14 +203,7 @@ mod tests {
         let network = oracle.register(secret.public_key(), 2).await.unwrap();
         broadcast_engine.start(network);
 
-        let shard_config = coding::Config {
-            partition_prefix: "shards".to_string(),
-            items_per_section: NonZero::new(100).unwrap(),
-            replay_buffer: NonZero::new(100).unwrap(),
-            write_buffer: NonZero::new(100).unwrap(),
-            buffer_pool: PoolRef::new(PAGE_SIZE, PAGE_CACHE_SIZE),
-        };
-        let shards = ShardLayer::init(context.with_label("shard"), shard_config, buffer, ()).await;
+        let shards = ShardLayer::new(buffer, ());
 
         let (actor, mailbox) = actor::Actor::init(context.clone(), config).await;
         let application = Application::<B>::default();
@@ -219,19 +212,6 @@ mod tests {
         actor.start(application.clone(), shards, resolver);
 
         (application, mailbox)
-    }
-
-    fn make_finalization_vote(proposal: Proposal<D>, share: &Sh) -> Finalize<V, D> {
-        let proposal_msg = proposal.encode();
-
-        // Generate proposal signature
-        let proposal_partial =
-            partial_sign_message::<V>(share, Some(&finalize_namespace(NAMESPACE)), &proposal_msg);
-
-        Finalize {
-            proposal,
-            proposal_signature: proposal_partial,
-        }
     }
 
     fn make_finalization(proposal: Proposal<D>, shares: &[Sh], quorum: u32) -> Finalization<V, D> {
@@ -368,7 +348,7 @@ mod tests {
 
     #[test_traced("DEBUG")]
     fn test_finalize_good_links() {
-        for seed in 0..1 {
+        for seed in 0..5 {
             let result1 = finalize(seed, LINK);
             let result2 = finalize(seed, LINK);
 
@@ -419,16 +399,13 @@ mod tests {
             // Add links between all peers
             setup_network_links(&mut oracle, &peers, link.clone()).await;
 
-            // Smaller number of blocks for debugging; rm later.
-            const NUM_BLOCKS: u64 = 4;
-
             // Generate blocks, skipping the genesis block.
             let mut blocks = Vec::<B>::new();
             let mut parent = Sha256::hash(b"");
             for i in 1..=NUM_BLOCKS {
                 let inner = Block::new::<Sha256>(parent, i, i);
                 let block = B::new(inner, (peers.len() as u16, (peers.len() / 2) as u16));
-                parent = block.digest();
+                parent = block.commitment();
                 blocks.push(block);
             }
 
@@ -478,16 +455,9 @@ mod tests {
                     .report(Activity::Notarization(notarization.clone()))
                     .await;
 
-                // Wait for the block to be broadcast, but due to jitter, we may or may not receive
-                // the block before continuing.
-                context.sleep(link.latency).await;
-
                 // Finalize block by all validators
                 let fin = make_finalization(proposal.clone(), &shares, QUORUM);
-                for (i, actor) in actors.iter_mut().enumerate() {
-                    let fin_vote = make_finalization_vote(proposal.clone(), &shares[i]);
-                    actor.report(Activity::Finalize(fin_vote)).await;
-
+                for actor in actors.iter_mut() {
                     // Always finalize 1) the last block in each epoch 2) the last block in the chain.
                     // Otherwise, finalize randomly.
                     if height == NUM_BLOCKS
@@ -751,7 +721,7 @@ mod tests {
 
     #[test_traced("DEBUG")]
     fn test_subscribe_blocks_from_different_sources() {
-        let runner = deterministic::Runner::timed(Duration::from_secs(60));
+        let runner = deterministic::Runner::default();
         runner.start(|mut context| async move {
             let mut oracle = setup_network(context.clone());
             let (schemes, peers, identity, shares) = setup_validators_and_shares(&mut context);
@@ -804,6 +774,11 @@ mod tests {
                     .await;
             }
 
+            context.sleep(Duration::from_millis(20)).await;
+
+            let notarization1 = make_notarization(proposal1.clone(), &shares, QUORUM);
+            actor.report(Activity::Notarization(notarization1)).await;
+
             // Block1: delivered
             let received1 = sub1_rx.await.unwrap();
             assert_eq!(received1.digest(), block1.digest());
@@ -829,6 +804,11 @@ mod tests {
                     .report(Activity::Notarize(notarization_vote.clone()))
                     .await;
             }
+
+            context.sleep(Duration::from_millis(20)).await;
+
+            let notarization2 = make_notarization(proposal2.clone(), &shares, QUORUM);
+            actor.report(Activity::Notarization(notarization2)).await;
 
             // Block2: delivered
             let received2 = sub2_rx.await.unwrap();

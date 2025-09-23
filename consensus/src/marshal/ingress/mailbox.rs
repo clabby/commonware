@@ -17,16 +17,14 @@ use tracing::error;
 /// system to drive the state of the marshal.
 pub(crate) enum Message<V: Variant, B: Block, P: PublicKey, H: Hasher> {
     // -------------------- Application Messages --------------------
-    /// A request to retrieve a block by its digest.
+    /// A request to retrieve a block by its commitment.
     Get {
-        /// The digest of the block to retrieve.
+        /// The commitment of the block to retrieve.
         commitment: B::Commitment,
         /// A channel to send the retrieved block.
         response: oneshot::Sender<Option<B>>,
     },
     /// A request to retrieve a block by its commitment.
-    ///
-    /// TODO: For a cleaner API, we should have this be retrieve-by-digest.
     Subscribe {
         /// The view in which the block was notarized. This is an optimization
         /// to help locate the block.

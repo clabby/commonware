@@ -259,7 +259,7 @@ where
     pub fn start<R>(
         mut self,
         application: impl Reporter<Activity = B>,
-        shards: ShardLayer<E, P, B, H>,
+        shards: ShardLayer<P, B, H>,
         resolver: (mpsc::Receiver<handler::Message<B>>, R),
     ) -> Handle<()>
     where
@@ -272,7 +272,7 @@ where
     async fn run<R>(
         mut self,
         application: impl Reporter<Activity = B>,
-        mut shard_layer: ShardLayer<E, P, B, H>,
+        mut shard_layer: ShardLayer<P, B, H>,
         (mut resolver_rx, mut resolver): (mpsc::Receiver<handler::Message<B>>, R),
     ) where
         R: Resolver<Key = handler::Request<B>>,
@@ -407,7 +407,7 @@ where
                             }
 
                             // We don't have the block locally, so fetch the block from the network
-                            // if we have an associated view. If we only have the digest, don't make
+                            // if we have an associated view. If we only have the commitment, don't make
                             // the request as we wouldn't know when to drop it, and the request may
                             // never complete if the block is not finalized.
                             if let Some(round) = round {
@@ -459,13 +459,12 @@ where
                             let block = self.get_finalized_block(height).await;
                             result.send(block).unwrap_or_else(|_| warn!(?height, "Failed to send block to orchestrator"));
                         }
-                        Orchestration::Processed { height, digest, commitment } => {
+                        Orchestration::Processed { height, commitment } => {
                             // Update metrics
                             self.processed_height.set(height as i64);
 
-                            // Cancel any outstanding requests (by height and by digest)
+                            // Cancel any outstanding requests (by height and by commitment)
                             resolver.cancel(Request::<B>::Block(commitment)).await;
-                            resolver.cancel(Request::<B>::CodingCommitment { height, digest }).await;
                             resolver.retain(Request::<B>::Finalized { height }.predicate()).await;
 
                             // If finalization exists, prune the archives
@@ -476,7 +475,6 @@ where
 
                                 // Prune archives
                                 self.cache.prune(prune_round).await;
-                                shard_layer.prune(height).await;
 
                                 // Update the last processed round
                                 let round = finalization.round();
@@ -502,22 +500,14 @@ where
 
                             // Iterate backwards, repairing blocks as we go.
                             while cursor.height() > height {
-                                let digest = cursor.parent();
-                                let Some(commitment) = shard_layer.get_commitment(&digest).await else {
-                                    resolver.fetch(Request::<B>::CodingCommitment {
-                                        digest,
-                                        height: cursor.height().saturating_sub(1)
-                                    }).await;
-                                    break;
-                                };
-
+                                let commitment = cursor.parent();
                                 if let Some(block) = self.find_block(&mut shard_layer, commitment).await {
                                     let finalization = self.cache.get_finalization_for(commitment).await;
                                     self.finalize(block.height(), commitment, block.clone(), finalization, &mut notifier_tx).await;
                                     debug!(height = block.height(), "repaired block");
                                     cursor = block;
                                 } else {
-                                    // Request the next missing block digest
+                                    // Request the next missing block commitment
                                     resolver.fetch(Request::<B>::Block(commitment)).await;
                                     break;
                                 }
@@ -526,7 +516,7 @@ where
                             // If we haven't fully repaired the gap, then also request any possible
                             // finalizations for the blocks in the remaining gap. This may help
                             // shrink the size of the gap if finalizations for the requests heights
-                            // exist. If not, we rely on the recursive digest fetch above.
+                            // exist. If not, we rely on the recursive commitment fetch above.
                             let gap_start = height;
                             let gap_end = std::cmp::min(cursor.height(), gap_start.saturating_add(self.max_repair));
                             debug!(gap_start, gap_end, "requesting any finalized blocks");
@@ -552,14 +542,6 @@ where
                                         continue;
                                     };
                                     let _ = response.send(block.encode().into());
-                                }
-                                Request::CodingCommitment { digest, .. } => {
-                                    // Check for coding commitment locally
-                                    let Some(commitment) = shard_layer.get_commitment(&digest).await else {
-                                        debug!(?digest, "coding commitment missing on request");
-                                        continue;
-                                    };
-                                    let _ = response.send(commitment.encode().into());
                                 }
                                 Request::Finalized { height } => {
                                     // Get finalization
@@ -614,30 +596,6 @@ where
                                     let finalization = self.cache.get_finalization_for(commitment).await;
                                     self.finalize(height, commitment, block, finalization, &mut notifier_tx).await;
                                     debug!(?commitment, height, "received block");
-                                    let _ = response.send(true);
-                                },
-                                Request::CodingCommitment { digest, height } => {
-                                    // Parse block digest and height
-                                    let Ok(commitment) = B::Commitment::decode_cfg(value.as_ref(), &()) else {
-                                        let _ = response.send(false);
-                                        continue;
-                                    };
-
-                                    // Persist the commitment.
-                                    //
-                                    // This operation is unsafe at the moment; we trust our peer sent us the correct
-                                    // commitment for the given digest. We should instead ask for the erasure coded
-                                    // chunks and reproduce the commitment ourselves.
-                                    unsafe {
-                                        shard_layer.put_commitment(height, digest, commitment).await;
-                                    }
-
-                                    // If we have the block, persist it and its finalization.
-                                    if let Some(block) = self.find_block(&mut shard_layer, commitment).await {
-                                        let finalization = self.cache.get_finalization_for(commitment).await;
-                                        self.finalize(block.height(), commitment, block.clone(), finalization, &mut notifier_tx).await;
-                                    }
-
                                     let _ = response.send(true);
                                 },
                                 Request::Finalized { height } => {
@@ -798,7 +756,7 @@ where
     /// Looks for a block anywhere in local storage.
     async fn find_block(
         &mut self,
-        shards: &mut ShardLayer<E, P, B, H>,
+        shards: &mut ShardLayer<P, B, H>,
         commitment: B::Commitment,
     ) -> Option<B> {
         // Check shard layer.

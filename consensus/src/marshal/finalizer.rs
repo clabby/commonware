@@ -81,7 +81,6 @@ impl<B: Block, R: Spawner + Clock + Metrics + Storage, Z: Reporter<Activity = B>
                 // height is processed by the application), it is possible that the application may
                 // be asked to process a block it has already seen (which it can simply ignore).
                 let commitment = block.commitment();
-                let digest = block.digest();
                 self.application.report(block).await;
 
                 // Record that we have processed up through this height.
@@ -92,9 +91,7 @@ impl<B: Block, R: Spawner + Clock + Metrics + Storage, Z: Reporter<Activity = B>
                 }
 
                 // Notify the orchestrator that the block has been processed.
-                self.orchestrator
-                    .processed(height, digest, commitment)
-                    .await;
+                self.orchestrator.processed(height, commitment).await;
 
                 // Loop again without waiting for a notification (there may be more to process).
                 continue;

@@ -13,18 +13,10 @@ use commonware_codec::{Encode, EncodeSize, Error as CodecError, Read, ReadExt, W
 use commonware_coding::reed_solomon::{self, decode, Chunk, Error as ReedSolomonError};
 use commonware_cryptography::{Committable, Digestible, Hasher, PublicKey};
 use commonware_p2p::Recipients;
-use commonware_runtime::{buffer::PoolRef, Clock, Metrics, Spawner, Storage};
-use commonware_storage::{
-    archive::{prunable, Archive, Identifier},
-    translator::TwoCap,
-};
 use futures::channel::oneshot;
-use governor::clock::Clock as GClock;
-use rand::Rng;
 use std::{
     collections::{btree_map::Entry, BTreeMap},
     fmt::Debug,
-    num::{NonZero, NonZeroUsize},
     ops::Deref,
 };
 use thiserror::Error;
@@ -42,24 +34,6 @@ pub enum ReconstructionError {
     Codec(#[from] CodecError),
 }
 
-/// Storage configuration for the [ShardLayer].
-pub struct Config {
-    /// Namespace prefix for the underlying storage partitions.
-    pub partition_prefix: String,
-
-    /// Number of items per section in the [prunable::Archive].
-    pub items_per_section: NonZero<u64>,
-
-    /// Rpelay buffer size for the [prunable::Archive].
-    pub replay_buffer: NonZeroUsize,
-
-    /// Write buffer size for the [prunable::Archive].
-    pub write_buffer: NonZeroUsize,
-
-    /// Buffer pool for the [prunable::Archive].
-    pub buffer_pool: PoolRef,
-}
-
 /// A subscription for a block by its commitment.
 struct BlockSubscription<B: Block> {
     subscribers: Vec<oneshot::Sender<B>>,
@@ -72,9 +46,8 @@ struct ChunkSubscription<H: Hasher> {
 
 /// A layer that handles receiving erasure coded [Block]s from the [Actor](super::super::actor::Actor),
 /// broadcasting them to peers, and reassembling them from received [Shard]s.
-pub struct ShardLayer<E, P, B, H>
+pub struct ShardLayer<P, B, H>
 where
-    E: Rng + Spawner + Metrics + Clock + GClock + Storage,
     P: PublicKey,
     B: Block<Digest = H::Digest, Commitment = H::Digest>,
     H: Hasher,
@@ -85,9 +58,6 @@ where
     /// [`Read`] configuration for the block type.
     block_codec_cfg: B::Cfg,
 
-    /// Map of block digests -> coding commitments.
-    digest_map: prunable::Archive<TwoCap, E, H::Digest, H::Digest>,
-
     /// Open subscriptions for blocks by commitment.
     block_subscriptions: BTreeMap<B::Commitment, BlockSubscription<B>>,
 
@@ -95,38 +65,17 @@ where
     chunk_subscriptions: BTreeMap<(B::Commitment, u16), ChunkSubscription<H>>,
 }
 
-impl<E, P, B, H> ShardLayer<E, P, B, H>
+impl<P, B, H> ShardLayer<P, B, H>
 where
-    E: Rng + Spawner + Metrics + Clock + GClock + Storage,
     P: PublicKey,
     B: Block<Digest = H::Digest, Commitment = H::Digest> + Debug,
     H: Hasher,
 {
     /// Create a new [ShardLayer] with the given buffered mailbox.
-    pub async fn init(
-        context: E,
-        cfg: Config,
-        mailbox: buffered::Mailbox<P, Shard<B, H>>,
-        block_codec_cfg: B::Cfg,
-    ) -> Self {
-        let cfg = |name: &str| prunable::Config {
-            partition: format!("shard-layer-{}-{name}-map", cfg.partition_prefix),
-            translator: TwoCap,
-            items_per_section: cfg.items_per_section,
-            compression: None,
-            codec_config: (),
-            buffer_pool: cfg.buffer_pool.clone(),
-            replay_buffer: cfg.replay_buffer,
-            write_buffer: cfg.write_buffer,
-        };
-        let digest_map = prunable::Archive::init(context.with_label("digest-map"), cfg("digest"))
-            .await
-            .unwrap_or_else(|_| panic!("Failed to initialize digest archive"));
-
+    pub fn new(mailbox: buffered::Mailbox<P, Shard<B, H>>, block_codec_cfg: B::Cfg) -> Self {
         Self {
             mailbox,
             block_codec_cfg,
-            digest_map,
             block_subscriptions: BTreeMap::new(),
             chunk_subscriptions: BTreeMap::new(),
         }
@@ -213,14 +162,6 @@ where
         // Attempt to decode the block from the recovered data.
         let block = B::decode_cfg(&mut recovered.as_slice(), &self.block_codec_cfg)?;
 
-        // Persist the digest -> commitment mapping for future lookups.
-        //
-        // SAFETY: We just verified the block's integrity by reconstructing it from the chunks.
-        unsafe {
-            self.put_commitment(block.height(), block.digest(), commitment)
-                .await;
-        }
-
         // Attempt to resolve any open subscriptions for this block.
         if let Some(mut subs) = self.block_subscriptions.remove(&commitment) {
             for sub in subs.subscribers.drain(..) {
@@ -293,40 +234,6 @@ where
                 entry.get_mut().subscribers.push(responder);
             }
         }
-    }
-
-    /// Puts a coding commitment in the store, keyed by digest and block height.
-    ///
-    /// # Safety
-    ///
-    /// Callers of this function must ensure that the provided commitment is correct for the
-    /// block with the given height and digest.
-    pub async unsafe fn put_commitment(
-        &mut self,
-        height: u64,
-        digest: B::Digest,
-        commitment: B::Commitment,
-    ) {
-        self.digest_map
-            .put(height, digest, commitment)
-            .await
-            .expect("failed to put digest");
-    }
-
-    /// Gets the block digest for a block with the given coding commitment, if known.
-    pub async fn get_commitment(&mut self, digest: &B::Digest) -> Option<B::Commitment> {
-        self.digest_map
-            .get(Identifier::Key(digest))
-            .await
-            .expect("failed to get digest")
-    }
-
-    /// Prunes old entries from the internal maps.
-    pub async fn prune(&mut self, up_to: u64) {
-        self.digest_map
-            .prune(up_to)
-            .await
-            .expect("failed to prune maps");
     }
 }
 
