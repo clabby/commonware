@@ -328,9 +328,6 @@ where
                         Message::Broadcast { coding_commitment, config, chunks } => {
                             shard_layer.broadcast_chunks(coding_commitment, config, chunks).await;
                         }
-                        Message::Verified { round, block } => {
-                            self.cache_verified(round, block.commitment(), block).await;
-                        }
                         Message::Notarize { notarization } => {
                             let commitment = notarization.proposal.payload;
                             let index = notarization.proposal_signature.index as u16;
@@ -607,6 +604,7 @@ where
 
                                     // Validation
                                     if block.height() != height
+                                        || block.commitment() != finalization.proposal.payload
                                         || !finalization.verify(&self.namespace, &self.identity)
                                     {
                                         let _ = response.send(false);
@@ -627,6 +625,7 @@ where
 
                                     // Validation
                                     if notarization.round() != round
+                                        || block.commitment() != notarization.proposal.payload
                                         || !notarization.verify(&self.namespace, &self.identity)
                                     {
                                         let _ = response.send(false);
@@ -673,12 +672,6 @@ where
     }
 
     // -------------------- Prunable Storage --------------------
-
-    /// Add a verified block to the prunable archive.
-    async fn cache_verified(&mut self, round: Round, commitment: B::Commitment, block: B) {
-        self.notify_subscribers(commitment, &block).await;
-        self.cache.put_verified(round, commitment, block).await;
-    }
 
     /// Add a notarized block to the prunable archive.
     async fn cache_block(&mut self, round: Round, commitment: B::Commitment, block: B) {
