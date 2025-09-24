@@ -68,7 +68,7 @@ where
 impl<P, B, H> ShardLayer<P, B, H>
 where
     P: PublicKey,
-    B: Block<Digest = H::Digest, Commitment = H::Digest> + Debug,
+    B: Block<Digest = H::Digest, Commitment = H::Digest>,
     H: Hasher,
 {
     /// Create a new [ShardLayer] with the given buffered mailbox.
@@ -323,7 +323,7 @@ where
     B: Block<Digest = H::Digest, Commitment = H::Digest>,
     H: Hasher,
 {
-    type Digest = B::Digest;
+    type Digest = H::Digest;
 
     fn digest(&self) -> Self::Digest {
         // NOTE: This is a lil weird; only doing this to namespace the shard within the buffered mailbox, such that
@@ -443,6 +443,11 @@ where
     pub fn inner(&self) -> &B {
         &self.inner
     }
+
+    /// Takes the inner [Block] out of the [CodedBlock].
+    pub fn take_inner(self) -> B {
+        self.inner
+    }
 }
 
 impl<B, H> Write for CodedBlock<B, H>
@@ -506,7 +511,7 @@ where
     B: Block<Digest = H::Digest, Commitment = H::Digest>,
     H: Hasher,
 {
-    type Commitment = B::Commitment;
+    type Commitment = H::Digest;
 
     fn commitment(&self) -> Self::Commitment {
         self.commitment

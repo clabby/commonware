@@ -9,14 +9,16 @@ use super::{
     },
 };
 use crate::{
-    marshal::ingress::coding::ShardLayer,
+    marshal::ingress::coding::{CodedBlock, ShardLayer},
     threshold_simplex::types::{Finalization, Notarization},
     types::Round,
     Block, Reporter,
 };
 use commonware_codec::{Decode, Encode};
 use commonware_coding::reed_solomon::Chunk;
-use commonware_cryptography::{bls12381::primitives::variant::Variant, Hasher, PublicKey};
+use commonware_cryptography::{
+    bls12381::primitives::variant::Variant, Committable, Hasher, PublicKey,
+};
 use commonware_macros::select;
 use commonware_resolver::Resolver;
 use commonware_runtime::{Clock, Handle, Metrics, Spawner, Storage};
@@ -66,7 +68,7 @@ struct ChunkSubscription<H: Hasher> {
 /// behind.
 pub struct Actor<B, E, V, P, H>
 where
-    B: Block,
+    B: Block<Digest = H::Digest, Commitment = H::Digest>,
     E: Rng + Spawner + Metrics + Clock + GClock + Storage,
     V: Variant,
     P: PublicKey,
@@ -106,11 +108,11 @@ where
 
     // ---------- Storage ----------
     // Prunable cache
-    cache: cache::Manager<E, B, V>,
+    cache: cache::Manager<E, CodedBlock<B, H>, V>,
     // Finalizations stored by height
     finalizations_by_height: immutable::Archive<E, B::Commitment, Finalization<V, B::Commitment>>,
     // Finalized blocks stored by height
-    finalized_blocks: immutable::Archive<E, B::Commitment, B>,
+    finalized_blocks: immutable::Archive<E, B::Commitment, CodedBlock<B, H>>,
 
     // ---------- Metrics ----------
     // Latest height metric
@@ -259,11 +261,11 @@ where
     pub fn start<R>(
         mut self,
         application: impl Reporter<Activity = B>,
-        shards: ShardLayer<P, B, H>,
-        resolver: (mpsc::Receiver<handler::Message<B>>, R),
+        shards: ShardLayer<P, CodedBlock<B, H>, H>,
+        resolver: (mpsc::Receiver<handler::Message<CodedBlock<B, H>>>, R),
     ) -> Handle<()>
     where
-        R: Resolver<Key = handler::Request<B>>,
+        R: Resolver<Key = handler::Request<CodedBlock<B, H>>>,
     {
         self.context.spawn_ref()(self.run(application, shards, resolver))
     }
@@ -272,10 +274,10 @@ where
     async fn run<R>(
         mut self,
         application: impl Reporter<Activity = B>,
-        mut shard_layer: ShardLayer<P, B, H>,
-        (mut resolver_rx, mut resolver): (mpsc::Receiver<handler::Message<B>>, R),
+        mut shard_layer: ShardLayer<P, CodedBlock<B, H>, H>,
+        (mut resolver_rx, mut resolver): (mpsc::Receiver<handler::Message<CodedBlock<B, H>>>, R),
     ) where
-        R: Resolver<Key = handler::Request<B>>,
+        R: Resolver<Key = handler::Request<CodedBlock<B, H>>>,
     {
         // Process all finalized blocks in order (fetching any that are missing)
         let (mut notifier_tx, notifier_rx) = mpsc::channel::<()>(1);
@@ -294,7 +296,7 @@ where
             .spawn(|_| finalizer.run());
 
         // Create a local pool for waiter futures
-        let mut block_waiters = AbortablePool::<(B::Commitment, B)>::default();
+        let mut block_waiters = AbortablePool::<(B::Commitment, CodedBlock<B, H>)>::default();
         let mut chunk_waiters = AbortablePool::<((B::Commitment, u16), Chunk<H>)>::default();
 
         // Handle messages
@@ -346,7 +348,7 @@ where
                                 self.cache_block(round, commitment, block).await;
                             } else {
                                 debug!(?round, "notarized block missing");
-                                resolver.fetch(Request::<B>::Notarized { round }).await;
+                                resolver.fetch(Request::<CodedBlock<B, H>>::Notarized { round }).await;
                             }
                         }
                         Message::Finalize { finalization } => {
@@ -370,13 +372,13 @@ where
                             } else {
                                 // Otherwise, fetch the block from the network.
                                 debug!(?round, ?commitment, "finalized block missing");
-                                resolver.fetch(Request::<B>::Block(commitment)).await;
+                                resolver.fetch(Request::<CodedBlock<B, H>>::Block(commitment)).await;
                             }
                         }
                         Message::Get { commitment, response } => {
                             // Check for block locally
                             let result = self.find_block(&mut shard_layer, commitment).await;
-                            let _ = response.send(result);
+                            let _ = response.send(result.map(CodedBlock::take_inner));
                         }
                         Message::SubscribeChunk { commitment, index, response } => {
                             match self.chunk_subscriptions.entry(commitment) {
@@ -399,7 +401,7 @@ where
                         Message::Subscribe { round, commitment, response } => {
                             // Check for block locally
                             if let Some(block) = self.find_block(&mut shard_layer, commitment).await {
-                                let _ = response.send(block);
+                                let _ = response.send(block.take_inner());
                                 continue;
                             }
 
@@ -420,7 +422,7 @@ where
                                 // If this is a valid view, this request should be fine to keep open
                                 // until resolution or pruning (even if the oneshot is canceled).
                                 debug!(?round, ?commitment, "requested block missing");
-                                resolver.fetch(Request::<B>::Notarized { round }).await;
+                                resolver.fetch(Request::<CodedBlock<B, H>>::Notarized { round }).await;
                             }
 
                             // Register subscriber
@@ -454,15 +456,15 @@ where
                         Orchestration::Get { height, result } => {
                             // Check if in blocks
                             let block = self.get_finalized_block(height).await;
-                            result.send(block).unwrap_or_else(|_| warn!(?height, "Failed to send block to orchestrator"));
+                            result.send(block.map(CodedBlock::take_inner)).unwrap_or_else(|_| warn!(?height, "Failed to send block to orchestrator"));
                         }
                         Orchestration::Processed { height, commitment } => {
                             // Update metrics
                             self.processed_height.set(height as i64);
 
                             // Cancel any outstanding requests (by height and by commitment)
-                            resolver.cancel(Request::<B>::Block(commitment)).await;
-                            resolver.retain(Request::<B>::Finalized { height }.predicate()).await;
+                            resolver.cancel(Request::<CodedBlock<B, H>>::Block(commitment)).await;
+                            resolver.retain(Request::<CodedBlock<B, H>>::Finalized { height }.predicate()).await;
 
                             // If finalization exists, prune the archives
                             if let Some(finalization) = self.get_finalization_by_height(height).await {
@@ -478,7 +480,7 @@ where
                                 self.last_processed_round = round;
 
                                 // Cancel useless requests
-                                resolver.retain(Request::<B>::Notarized { round }.predicate()).await;
+                                resolver.retain(Request::<CodedBlock<B, H>>::Notarized { round }.predicate()).await;
                             }
                         }
                         Orchestration::Repair { height } => {
@@ -505,7 +507,7 @@ where
                                     cursor = block;
                                 } else {
                                     // Request the next missing block commitment
-                                    resolver.fetch(Request::<B>::Block(commitment)).await;
+                                    resolver.fetch(Request::<CodedBlock<B, H>>::Block(commitment)).await;
                                     break;
                                 }
                             }
@@ -518,7 +520,7 @@ where
                             let gap_end = std::cmp::min(cursor.height(), gap_start.saturating_add(self.max_repair));
                             debug!(gap_start, gap_end, "requesting any finalized blocks");
                             for height in gap_start..gap_end {
-                                resolver.fetch(Request::<B>::Finalized { height }).await;
+                                resolver.fetch(Request::<CodedBlock<B, H>>::Finalized { height }).await;
                             }
                         }
                     }
@@ -577,7 +579,7 @@ where
                             match key {
                                 Request::Block(commitment) => {
                                     // Parse block
-                                    let Ok(block) = B::decode_cfg(value.as_ref(), &self.codec_config) else {
+                                    let Ok(block) = CodedBlock::<B, H>::decode_cfg(value.as_ref(), &self.codec_config) else {
                                         let _ = response.send(false);
                                         continue;
                                     };
@@ -597,7 +599,7 @@ where
                                 },
                                 Request::Finalized { height } => {
                                     // Parse finalization
-                                    let Ok((finalization, block)) = <(Finalization<V, B::Commitment>, B)>::decode_cfg(value, &((), self.codec_config.clone())) else {
+                                    let Ok((finalization, block)) = <(Finalization<V, B::Commitment>, CodedBlock<B, H>)>::decode_cfg(value, &((), self.codec_config.clone())) else {
                                         let _ = response.send(false);
                                         continue;
                                     };
@@ -618,7 +620,7 @@ where
                                 },
                                 Request::Notarized { round } => {
                                     // Parse notarization
-                                    let Ok((notarization, block)) = <(Notarization<V, B::Commitment>, B)>::decode_cfg(value, &((), self.codec_config.clone())) else {
+                                    let Ok((notarization, block)) = <(Notarization<V, B::Commitment>, CodedBlock<B, H>)>::decode_cfg(value, &((), self.codec_config.clone())) else {
                                         let _ = response.send(false);
                                         continue;
                                     };
@@ -663,10 +665,10 @@ where
     // -------------------- Waiters --------------------
 
     /// Notify any subscribers for the given commitment with the provided block.
-    async fn notify_subscribers(&mut self, commitment: B::Commitment, block: &B) {
+    async fn notify_subscribers(&mut self, commitment: B::Commitment, block: &CodedBlock<B, H>) {
         if let Some(mut bs) = self.block_subscriptions.remove(&commitment) {
             for subscriber in bs.subscribers.drain(..) {
-                let _ = subscriber.send(block.clone());
+                let _ = subscriber.send(block.clone().take_inner());
             }
         }
     }
@@ -674,7 +676,12 @@ where
     // -------------------- Prunable Storage --------------------
 
     /// Add a notarized block to the prunable archive.
-    async fn cache_block(&mut self, round: Round, commitment: B::Commitment, block: B) {
+    async fn cache_block(
+        &mut self,
+        round: Round,
+        commitment: B::Commitment,
+        block: CodedBlock<B, H>,
+    ) {
         self.notify_subscribers(commitment, &block).await;
         self.cache.put_block(round, commitment, block).await;
     }
@@ -682,7 +689,7 @@ where
     // -------------------- Immutable Storage --------------------
 
     /// Get a finalized block from the immutable archive.
-    async fn get_finalized_block(&self, height: u64) -> Option<B> {
+    async fn get_finalized_block(&self, height: u64) -> Option<CodedBlock<B, H>> {
         match self.finalized_blocks.get(Identifier::Index(height)).await {
             Ok(block) => block,
             Err(e) => panic!("failed to get block: {e}"),
@@ -712,7 +719,7 @@ where
         &mut self,
         height: u64,
         commitment: B::Commitment,
-        block: B,
+        block: CodedBlock<B, H>,
         finalization: Option<Finalization<V, B::Commitment>>,
         notifier: &mut mpsc::Sender<()>,
     ) {
@@ -749,9 +756,9 @@ where
     /// Looks for a block anywhere in local storage.
     async fn find_block(
         &mut self,
-        shards: &mut ShardLayer<P, B, H>,
+        shards: &mut ShardLayer<P, CodedBlock<B, H>, H>,
         commitment: B::Commitment,
-    ) -> Option<B> {
+    ) -> Option<CodedBlock<B, H>> {
         // Check shard layer.
         if let Some(block) = shards
             .try_reconstruct(commitment)
