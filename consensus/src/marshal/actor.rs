@@ -15,7 +15,6 @@ use crate::{
     Block, Reporter,
 };
 use commonware_codec::{Decode, Encode};
-use commonware_coding::reed_solomon::Chunk;
 use commonware_cryptography::{
     bls12381::primitives::variant::Variant, Committable, Hasher, PublicKey,
 };

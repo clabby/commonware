@@ -334,19 +334,6 @@ mod tests {
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    fn shard(block: &B, peers: &[P]) -> (D, (u16, u16), Vec<(P, Chunk<H>)>) {
-        let (total, min) = (peers.len() as u16, peers.len() as u16 / 2);
-        let block = CodedBlock::<B, H>::new(block.clone(), (total, min));
-        let (commitment, chunks) =
-            reed_solomon::encode::<H>(total, min, block.encode().into()).unwrap();
-        (
-            commitment,
-            (total, min),
-            peers.iter().cloned().zip(chunks).collect(),
-        )
-    }
-
     #[test_traced("DEBUG")]
     fn test_finalize_good_links() {
         for seed in 0..5 {
@@ -401,14 +388,14 @@ mod tests {
             setup_network_links(&mut oracle, &peers, link.clone()).await;
 
             // Generate blocks, skipping the genesis block.
-            let mut blocks = Vec::<B>::new();
+            let mut blocks = Vec::<CodedBlock<B, H>>::new();
             let mut parent = Sha256::hash(b"");
             let (total, min) = (peers.len() as u16, (peers.len() / 2) as u16);
             for i in 1..=NUM_BLOCKS {
-                let block = Block::new::<Sha256>(parent, i, i);
-                let block = CodedBlock::<B, H>::new(block, (total, min));
+                let inner = Block::new::<Sha256>(parent, i, i);
+                let block = CodedBlock::<B, H>::new(inner, (total, min));
                 parent = block.commitment();
-                blocks.push(block.take_inner());
+                blocks.push(block);
             }
 
             // Broadcast and finalize blocks in random order
@@ -426,8 +413,10 @@ mod tests {
                 let actor_index: usize = (height % (NUM_VALIDATORS as u64)) as usize;
                 let mut actor = actors[actor_index].clone();
 
-                let (commitment, config, chunks) = shard(block, &peers);
-                actor.broadcast(commitment, config, chunks).await;
+                let peers_and_chunks = peers.iter().cloned().zip(block.chunks().to_vec()).collect();
+                actor
+                    .broadcast(block.commitment(), block.config(), peers_and_chunks)
+                    .await;
 
                 // Wait for the block chunks to be delivered; Before making notarization votes,
                 // the chunks must be present.
@@ -436,7 +425,7 @@ mod tests {
                 let proposal = Proposal {
                     round,
                     parent: height.checked_sub(1).unwrap(),
-                    payload: commitment,
+                    payload: block.commitment(),
                 };
 
                 // All validators send a notarization for the block.

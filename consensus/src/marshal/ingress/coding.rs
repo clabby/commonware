@@ -39,11 +39,6 @@ struct BlockSubscription<B: Block> {
     subscribers: Vec<oneshot::Sender<B>>,
 }
 
-/// A subscription for a chunk by its commitment and index.
-struct ChunkSubscription<H: Hasher> {
-    subscribers: Vec<oneshot::Sender<Chunk<H>>>,
-}
-
 /// A layer that handles receiving erasure coded [Block]s from the [Actor](super::super::actor::Actor),
 /// broadcasting them to peers, and reassembling them from received [Shard]s.
 pub struct ShardLayer<P, B, H>
@@ -131,6 +126,9 @@ where
             .map(|c| c.chunk)
             .collect::<Vec<_>>();
 
+        // TODO: Make sure min is all valid chunks
+        // TODO: If we do encounter a block that's invalid, block the peer.
+
         if coded_chunks.len() < min as usize {
             // Not enough chunks to recover the block yet.
             debug!(
@@ -149,9 +147,9 @@ where
         // Attempt to decode the block from the recovered data.
         let block = B::decode_cfg(&mut recovered.as_slice(), &self.block_codec_cfg)?;
 
-        // Attempt to resolve any open subscriptions for this block.
-        if let Some(mut subs) = self.block_subscriptions.remove(&commitment) {
-            for sub in subs.subscribers.drain(..) {
+        // Notify any subscribers that have been waiting for this block.
+        if let Some(mut sub) = self.block_subscriptions.remove(&commitment) {
+            for sub in sub.subscribers.drain(..) {
                 let _ = sub.send(block.clone());
             }
         }
@@ -198,10 +196,7 @@ where
         commitment: B::Commitment,
         index: u16,
     ) -> Option<Shard<B, H>> {
-        let mut buf = vec![0u8; <H::Digest as FixedSize>::SIZE + 2];
-        buf[..<H::Digest as FixedSize>::SIZE].copy_from_slice(commitment.as_ref());
-        buf[<H::Digest as FixedSize>::SIZE..].copy_from_slice(index.to_le_bytes().as_ref());
-        let index_hash = H::hash(buf.as_ref());
+        let index_hash = shard_uuid::<B, H>(commitment, index);
         self.mailbox
             .get(None, commitment, Some(index_hash))
             .await
@@ -221,10 +216,7 @@ where
         index: u16,
         responder: oneshot::Sender<Shard<B, H>>,
     ) {
-        let mut buf = vec![0u8; <H::Digest as FixedSize>::SIZE + 2];
-        buf[..<H::Digest as FixedSize>::SIZE].copy_from_slice(commitment.as_ref());
-        buf[<H::Digest as FixedSize>::SIZE..].copy_from_slice(index.to_le_bytes().as_ref());
-        let index_hash = H::hash(buf.as_ref());
+        let index_hash = shard_uuid::<B, H>(commitment, index);
         self.mailbox
             .subscribe_prepared(None, commitment, Some(index_hash), responder)
             .await;
@@ -320,11 +312,7 @@ where
     type Digest = H::Digest;
 
     fn digest(&self) -> Self::Digest {
-        let mut buf = vec![0u8; <H::Digest as FixedSize>::SIZE + 2];
-        buf[..<H::Digest as FixedSize>::SIZE].copy_from_slice(self.commitment.as_ref());
-        buf[<H::Digest as FixedSize>::SIZE..]
-            .copy_from_slice(self.chunk.index.to_le_bytes().as_ref());
-        H::hash(buf.as_ref())
+        shard_uuid::<B, H>(self.commitment, self.chunk.index)
     }
 }
 
@@ -407,6 +395,8 @@ where
     config: (u16, u16),
     /// The erasure coding commitment.
     commitment: H::Digest,
+    /// The coded chunks.
+    chunks: Vec<Chunk<H>>,
 }
 
 impl<B, H> CodedBlock<B, H>
@@ -414,24 +404,23 @@ where
     B: Block<Digest = H::Digest, Commitment = H::Digest>,
     H: Hasher,
 {
-    /// Erasure codes the block to create the commitment.
-    fn commit(inner: &B, config: (u16, u16)) -> H::Digest {
+    /// Erasure codes the block.
+    fn encode(inner: &B, config: (u16, u16)) -> (H::Digest, Vec<Chunk<H>>) {
         let mut buf = Vec::with_capacity(config.encode_size() + inner.encode_size());
         inner.write(&mut buf);
         config.write(&mut buf);
 
-        let (commitment, _) =
-            reed_solomon::encode::<H>(config.0, config.1, buf).expect("failed to commit to block");
-        commitment
+        reed_solomon::encode::<H>(config.0, config.1, buf).expect("failed to commit to block")
     }
 
     /// Create a new [CodedBlock] from a [Block] and a configuration.
     pub fn new(inner: B, config: (u16, u16)) -> Self {
-        let commitment = Self::commit(&inner, config);
+        let (commitment, chunks) = Self::encode(&inner, config);
         Self {
             inner,
             config,
             commitment,
+            chunks,
         }
     }
 
@@ -443,6 +432,16 @@ where
     /// Takes the inner [Block] out of the [CodedBlock].
     pub fn take_inner(self) -> B {
         self.inner
+    }
+
+    /// Returns the erasure coding configuration.
+    pub fn config(&self) -> (u16, u16) {
+        self.config
+    }
+
+    /// Returns a reference to the coded chunks.
+    pub fn chunks(&self) -> &[Chunk<H>] {
+        self.chunks.as_slice()
     }
 }
 
@@ -470,12 +469,13 @@ where
     ) -> Result<Self, commonware_codec::Error> {
         let inner = B::read_cfg(buf, cfg)?;
         let config = <(u16, u16)>::read_cfg(buf, &((), ()))?;
-        let commitment = Self::commit(&inner, config);
+        let (commitment, chunks) = Self::encode(&inner, config);
 
         Ok(Self {
             inner,
             config,
             commitment,
+            chunks,
         })
     }
 }
@@ -545,6 +545,18 @@ where
     B: Block<Digest = H::Digest, Commitment = H::Digest> + PartialEq,
     H: Hasher,
 {
+}
+
+/// Creates a unique identifier for a shard based on the block commitment and shard index.
+fn shard_uuid<B, H>(commitment: B::Commitment, index: u16) -> H::Digest
+where
+    B: Block<Digest = H::Digest, Commitment = H::Digest>,
+    H: Hasher,
+{
+    let mut buf = vec![0u8; H::Digest::SIZE + u16::SIZE];
+    buf[..H::Digest::SIZE].copy_from_slice(commitment.as_ref());
+    buf[H::Digest::SIZE..].copy_from_slice(index.to_le_bytes().as_ref());
+    H::hash(buf.as_ref())
 }
 
 #[cfg(test)]
