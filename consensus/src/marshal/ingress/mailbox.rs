@@ -1,4 +1,5 @@
 use crate::{
+    marshal::ingress::coding::{CodedBlock, Shard},
     threshold_simplex::types::{Activity, Finalization, Finalize, Notarization, Notarize},
     types::Round,
     Block, Reporter,
@@ -15,7 +16,12 @@ use tracing::error;
 ///
 /// These messages are sent from the consensus engine and other parts of the
 /// system to drive the state of the marshal.
-pub(crate) enum Message<V: Variant, B: Block, P: PublicKey, H: Hasher> {
+pub(crate) enum Message<
+    V: Variant,
+    B: Block<Digest = H::Digest, Commitment = H::Digest>,
+    P: PublicKey,
+    H: Hasher,
+> {
     // -------------------- Application Messages --------------------
     /// A request to retrieve a block by its commitment.
     Get {
@@ -41,7 +47,7 @@ pub(crate) enum Message<V: Variant, B: Block, P: PublicKey, H: Hasher> {
         /// The index of the chunk to retrieve.
         index: u16,
         /// A channel to send the retrieved chunk.
-        response: oneshot::Sender<Chunk<H>>,
+        response: oneshot::Sender<Shard<CodedBlock<B, H>, H>>,
     },
     /// A request to broadcast an erasure coded block to all peers.
     Broadcast {
@@ -78,11 +84,18 @@ pub(crate) enum Message<V: Variant, B: Block, P: PublicKey, H: Hasher> {
 
 /// A mailbox for sending messages to the marshal [Actor](super::super::actor::Actor).
 #[derive(Clone)]
-pub struct Mailbox<V: Variant, B: Block, P: PublicKey, H: Hasher> {
+pub struct Mailbox<
+    V: Variant,
+    B: Block<Digest = H::Digest, Commitment = H::Digest>,
+    P: PublicKey,
+    H: Hasher,
+> {
     sender: mpsc::Sender<Message<V, B, P, H>>,
 }
 
-impl<V: Variant, B: Block, P: PublicKey, H: Hasher> Mailbox<V, B, P, H> {
+impl<V: Variant, B: Block<Digest = H::Digest, Commitment = H::Digest>, P: PublicKey, H: Hasher>
+    Mailbox<V, B, P, H>
+{
     /// Creates a new mailbox.
     pub(crate) fn new(sender: mpsc::Sender<Message<V, B, P, H>>) -> Self {
         Self { sender }
@@ -149,7 +162,7 @@ impl<V: Variant, B: Block, P: PublicKey, H: Hasher> Mailbox<V, B, P, H> {
         &mut self,
         commitment: B::Commitment,
         index: u16,
-    ) -> oneshot::Receiver<Chunk<H>> {
+    ) -> oneshot::Receiver<Shard<CodedBlock<B, H>, H>> {
         let (tx, rx) = oneshot::channel();
         if self
             .sender
@@ -188,7 +201,9 @@ impl<V: Variant, B: Block, P: PublicKey, H: Hasher> Mailbox<V, B, P, H> {
     }
 }
 
-impl<V: Variant, B: Block, P: PublicKey, H: Hasher> Reporter for Mailbox<V, B, P, H> {
+impl<V: Variant, B: Block<Digest = H::Digest, Commitment = H::Digest>, P: PublicKey, H: Hasher>
+    Reporter for Mailbox<V, B, P, H>
+{
     type Activity = Activity<V, B::Commitment>;
 
     async fn report(&mut self, activity: Self::Activity) {

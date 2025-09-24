@@ -9,7 +9,7 @@ use super::{
     },
 };
 use crate::{
-    marshal::ingress::coding::{CodedBlock, ShardLayer},
+    marshal::ingress::coding::{CodedBlock, Shard, ShardLayer},
     threshold_simplex::types::{Finalization, Notarization},
     types::Round,
     Block, Reporter,
@@ -47,9 +47,13 @@ struct BlockSubscription<B: Block> {
 }
 
 /// A struct that holds multiple subscriptions for a chunk.
-struct ChunkSubscription<H: Hasher> {
+struct ChunkSubscription<B, H>
+where
+    B: Block<Digest = H::Digest, Commitment = H::Digest>,
+    H: Hasher,
+{
     /// The subscribers that are waiting for the chunk
-    subscribers: Vec<oneshot::Sender<Chunk<H>>>,
+    subscribers: Vec<oneshot::Sender<Shard<CodedBlock<B, H>, H>>>,
     /// Aborter that aborts the waiter future when dropped
     _aborter: Aborter,
 }
@@ -104,7 +108,7 @@ where
     // Outstanding subscriptions for blocks
     block_subscriptions: BTreeMap<B::Commitment, BlockSubscription<B>>,
     // Outstanding subscriptions for chunks
-    chunk_subscriptions: BTreeMap<B::Commitment, ChunkSubscription<H>>,
+    chunk_subscriptions: BTreeMap<B::Commitment, ChunkSubscription<B, H>>,
 
     // ---------- Storage ----------
     // Prunable cache
@@ -297,7 +301,8 @@ where
 
         // Create a local pool for waiter futures
         let mut block_waiters = AbortablePool::<(B::Commitment, CodedBlock<B, H>)>::default();
-        let mut chunk_waiters = AbortablePool::<((B::Commitment, u16), Chunk<H>)>::default();
+        let mut chunk_waiters =
+            AbortablePool::<((B::Commitment, u16), Shard<CodedBlock<B, H>, H>)>::default();
 
         // Handle messages
         loop {
@@ -381,6 +386,12 @@ where
                             let _ = response.send(result.map(CodedBlock::take_inner));
                         }
                         Message::SubscribeChunk { commitment, index, response } => {
+                            // Check for chunk locally
+                            if let Some(shard) = shard_layer.get_chunk(commitment, index).await {
+                                let _ = response.send(shard);
+                                continue;
+                            }
+
                             match self.chunk_subscriptions.entry(commitment) {
                                 Entry::Occupied(mut entry) => {
                                     entry.get_mut().subscribers.push(response);

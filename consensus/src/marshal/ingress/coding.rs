@@ -9,7 +9,7 @@
 
 use crate::Block;
 use commonware_broadcast::{buffered, Broadcaster};
-use commonware_codec::{Encode, EncodeSize, Error as CodecError, Read, ReadExt, Write};
+use commonware_codec::{EncodeSize, Error as CodecError, FixedSize, Read, ReadExt, Write};
 use commonware_coding::reed_solomon::{self, decode, Chunk, Error as ReedSolomonError};
 use commonware_cryptography::{Committable, Digestible, Hasher, PublicKey};
 use commonware_p2p::Recipients;
@@ -60,9 +60,6 @@ where
 
     /// Open subscriptions for blocks by commitment.
     block_subscriptions: BTreeMap<B::Commitment, BlockSubscription<B>>,
-
-    /// Open subscriptions for chunks by commitment and index.
-    chunk_subscriptions: BTreeMap<(B::Commitment, u16), ChunkSubscription<H>>,
 }
 
 impl<P, B, H> ShardLayer<P, B, H>
@@ -77,7 +74,6 @@ where
             mailbox,
             block_codec_cfg,
             block_subscriptions: BTreeMap::new(),
-            chunk_subscriptions: BTreeMap::new(),
         }
     }
 
@@ -134,15 +130,6 @@ where
             .cloned()
             .map(|c| c.chunk)
             .collect::<Vec<_>>();
-
-        // Attempt to resolve any open subscriptions for the chunks we have.
-        for chunk in coded_chunks.iter() {
-            if let Some(mut subs) = self.chunk_subscriptions.remove(&(commitment, chunk.index)) {
-                for sub in subs.subscribers.drain(..) {
-                    let _ = sub.send(chunk.clone());
-                }
-            }
-        }
 
         if coded_chunks.len() < min as usize {
             // Not enough chunks to recover the block yet.
@@ -206,6 +193,23 @@ where
         Ok(())
     }
 
+    pub async fn get_chunk(
+        &mut self,
+        commitment: B::Commitment,
+        index: u16,
+    ) -> Option<Shard<B, H>> {
+        let mut buf = vec![0u8; <H::Digest as FixedSize>::SIZE + 2];
+        buf[..<H::Digest as FixedSize>::SIZE].copy_from_slice(commitment.as_ref());
+        buf[<H::Digest as FixedSize>::SIZE..].copy_from_slice(index.to_le_bytes().as_ref());
+        let index_hash = H::hash(buf.as_ref());
+        self.mailbox
+            .get(None, commitment, Some(index_hash))
+            .await
+            .iter()
+            .cloned()
+            .next()
+    }
+
     /// Subscribes to a chunk by commitment and index with an externally prepared responder.
     ///
     /// The responder will be sent the chunk when it is available; either instantly (if cached)
@@ -215,25 +219,15 @@ where
         &mut self,
         commitment: B::Commitment,
         index: u16,
-        responder: oneshot::Sender<Chunk<H>>,
+        responder: oneshot::Sender<Shard<B, H>>,
     ) {
-        let available_chunks = self.mailbox.get(None, commitment, None).await;
-
-        if let Some(shard) = available_chunks.iter().find(|s| s.chunk.index == index) {
-            let _ = responder.send(shard.chunk.clone());
-            return;
-        }
-
-        match self.chunk_subscriptions.entry((commitment, index)) {
-            Entry::Vacant(entry) => {
-                entry.insert(ChunkSubscription {
-                    subscribers: vec![responder],
-                });
-            }
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().subscribers.push(responder);
-            }
-        }
+        let mut buf = vec![0u8; <H::Digest as FixedSize>::SIZE + 2];
+        buf[..<H::Digest as FixedSize>::SIZE].copy_from_slice(commitment.as_ref());
+        buf[<H::Digest as FixedSize>::SIZE..].copy_from_slice(index.to_le_bytes().as_ref());
+        let index_hash = H::hash(buf.as_ref());
+        self.mailbox
+            .subscribe_prepared(None, commitment, Some(index_hash), responder)
+            .await;
     }
 }
 
@@ -326,9 +320,11 @@ where
     type Digest = H::Digest;
 
     fn digest(&self) -> Self::Digest {
-        // NOTE: This is a lil weird; only doing this to namespace the shard within the buffered mailbox, such that
-        // shards from separate validators can be enqueued without replacing each other.
-        H::hash(self.chunk.encode().as_ref())
+        let mut buf = vec![0u8; <H::Digest as FixedSize>::SIZE + 2];
+        buf[..<H::Digest as FixedSize>::SIZE].copy_from_slice(self.commitment.as_ref());
+        buf[<H::Digest as FixedSize>::SIZE..]
+            .copy_from_slice(self.chunk.index.to_le_bytes().as_ref());
+        H::hash(buf.as_ref())
     }
 }
 
