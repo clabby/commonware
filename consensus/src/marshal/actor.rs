@@ -9,7 +9,7 @@ use super::{
     },
 };
 use crate::{
-    marshal::ingress::coding::ShardLayer,
+    marshal::ingress::coding::{Shard, ShardLayer},
     threshold_simplex::types::{Finalization, Notarization},
     types::Round,
     Block, Reporter,
@@ -45,9 +45,13 @@ struct BlockSubscription<B: Block> {
 }
 
 /// A struct that holds multiple subscriptions for a chunk.
-struct ChunkSubscription<H: Hasher> {
+struct ChunkSubscription<B, H>
+where
+    B: Block<Digest = H::Digest, Commitment = H::Digest>,
+    H: Hasher,
+{
     /// The subscribers that are waiting for the chunk
-    subscribers: Vec<oneshot::Sender<Chunk<H>>>,
+    subscribers: Vec<oneshot::Sender<Shard<B, H>>>,
     /// Aborter that aborts the waiter future when dropped
     _aborter: Aborter,
 }
@@ -66,7 +70,7 @@ struct ChunkSubscription<H: Hasher> {
 /// behind.
 pub struct Actor<B, E, V, P, H>
 where
-    B: Block,
+    B: Block<Digest = H::Digest, Commitment = H::Digest>,
     E: Rng + Spawner + Metrics + Clock + GClock + Storage,
     V: Variant,
     P: PublicKey,
@@ -102,7 +106,7 @@ where
     // Outstanding subscriptions for blocks
     block_subscriptions: BTreeMap<B::Commitment, BlockSubscription<B>>,
     // Outstanding subscriptions for chunks
-    chunk_subscriptions: BTreeMap<B::Commitment, ChunkSubscription<H>>,
+    chunk_subscriptions: BTreeMap<B::Commitment, ChunkSubscription<B, H>>,
 
     // ---------- Storage ----------
     // Prunable cache
@@ -295,7 +299,7 @@ where
 
         // Create a local pool for waiter futures
         let mut block_waiters = AbortablePool::<(B::Commitment, B)>::default();
-        let mut chunk_waiters = AbortablePool::<((B::Commitment, u16), Chunk<H>)>::default();
+        let mut chunk_waiters = AbortablePool::<((B::Commitment, u16), Shard<B, H>)>::default();
 
         // Handle messages
         loop {

@@ -215,25 +215,12 @@ where
         &mut self,
         commitment: B::Commitment,
         index: u16,
-        responder: oneshot::Sender<Chunk<H>>,
+        responder: oneshot::Sender<Shard<B, H>>,
     ) {
-        let available_chunks = self.mailbox.get(None, commitment, None).await;
-
-        if let Some(shard) = available_chunks.iter().find(|s| s.chunk.index == index) {
-            let _ = responder.send(shard.chunk.clone());
-            return;
-        }
-
-        match self.chunk_subscriptions.entry((commitment, index)) {
-            Entry::Vacant(entry) => {
-                entry.insert(ChunkSubscription {
-                    subscribers: vec![responder],
-                });
-            }
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().subscribers.push(responder);
-            }
-        }
+        let index_hash = H::hash(index.to_le_bytes().as_ref());
+        self.mailbox
+            .subscribe_prepared(None, commitment, Some(index_hash), responder)
+            .await;
     }
 }
 
@@ -326,9 +313,7 @@ where
     type Digest = B::Digest;
 
     fn digest(&self) -> Self::Digest {
-        // NOTE: This is a lil weird; only doing this to namespace the shard within the buffered mailbox, such that
-        // shards from separate validators can be enqueued without replacing each other.
-        H::hash(self.chunk.encode().as_ref())
+        H::hash(self.chunk.index.to_le_bytes().as_ref())
     }
 }
 
