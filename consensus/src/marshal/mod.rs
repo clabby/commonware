@@ -86,7 +86,6 @@ mod tests {
     };
     use commonware_broadcast::buffered;
     use commonware_codec::Encode;
-    use commonware_coding::reed_solomon::{self, Chunk};
     use commonware_cryptography::{
         bls12381::{
             dkg::ops::generate_shares,

@@ -1,5 +1,4 @@
 use crate::{
-    marshal::ingress::coding::{CodedBlock, Shard},
     threshold_simplex::types::{Activity, Finalization, Finalize, Notarization, Notarize},
     types::Round,
     Block, Reporter,
@@ -40,15 +39,6 @@ pub(crate) enum Message<
         /// A channel to send the retrieved block.
         response: oneshot::Sender<B>,
     },
-    /// A request to retrieve an erasure coded chunk by its commitment and index.
-    SubscribeChunk {
-        /// The commitment of the chunk to retrieve.
-        commitment: B::Commitment,
-        /// The index of the chunk to retrieve.
-        index: u16,
-        /// A channel to send the retrieved chunk.
-        response: oneshot::Sender<Shard<CodedBlock<B, H>, H>>,
-    },
     /// A request to broadcast an erasure coded block to all peers.
     Broadcast {
         /// The coding commitment of the block.
@@ -57,6 +47,16 @@ pub(crate) enum Message<
         config: (u16, u16),
         /// The chunks and their corresponding participants.
         chunks: Vec<(P, Chunk<H>)>,
+    },
+    /// A reqeuest to verify that a shard of a block at a given index is contained within
+    /// the given commitment.
+    VerifyShard {
+        /// The coding commitment of the block.
+        commitment: B::Commitment,
+        /// The index of the shard to verify.
+        index: u16,
+        /// The response channel to send the result of the verification.
+        response: oneshot::Sender<bool>,
     },
 
     // -------------------- Consensus Engine Messages --------------------
@@ -149,36 +149,6 @@ impl<V: Variant, B: Block<Digest = H::Digest, Commitment = H::Digest>, P: Public
         rx
     }
 
-    /// Subscribe chunk is a request to receive an erasure coded chunk by its commitment and index.
-    ///
-    /// If the chunk is found available locally, the chunk will be returned immediately.
-    ///
-    /// If the chunk is not available locally, the request will be registered and the caller will
-    /// be notified when the chunk is available. If the chunk is not part of a finalized block, it's
-    /// possible that it may never become available.
-    ///
-    /// The oneshot receiver should be dropped to cancel the subscription.
-    pub async fn subscribe_chunk(
-        &mut self,
-        commitment: B::Commitment,
-        index: u16,
-    ) -> oneshot::Receiver<Shard<CodedBlock<B, H>, H>> {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .sender
-            .send(Message::SubscribeChunk {
-                commitment,
-                index,
-                response: tx,
-            })
-            .await
-            .is_err()
-        {
-            error!("failed to send subscribe chunk message to actor: receiver dropped");
-        }
-        rx
-    }
-
     /// Broadcast indicates that a block should be sent to all peers.
     pub async fn broadcast(
         &mut self,
@@ -197,6 +167,27 @@ impl<V: Variant, B: Block<Digest = H::Digest, Commitment = H::Digest>, P: Public
             .is_err()
         {
             error!("failed to send broadcast message to actor: receiver dropped");
+        }
+    }
+
+    /// Verifies that a shard of a block at a given index is contained within the given commitment.
+    pub async fn verify_shard(
+        &mut self,
+        commitment: B::Commitment,
+        index: u16,
+        response: oneshot::Sender<bool>,
+    ) {
+        if self
+            .sender
+            .send(Message::VerifyShard {
+                commitment,
+                index,
+                response,
+            })
+            .await
+            .is_err()
+        {
+            error!("failed to send verify shard message to actor: receiver dropped");
         }
     }
 }

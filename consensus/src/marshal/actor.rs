@@ -9,7 +9,7 @@ use super::{
     },
 };
 use crate::{
-    marshal::ingress::coding::{CodedBlock, Shard, ShardLayer},
+    marshal::ingress::coding::{CodedBlock, ShardLayer},
     threshold_simplex::types::{Finalization, Notarization},
     types::Round,
     Block, Reporter,
@@ -45,14 +45,10 @@ struct BlockSubscription<B: Block> {
     _aborter: Aborter,
 }
 
-/// A struct that holds multiple subscriptions for a chunk.
-struct ChunkSubscription<B, H>
-where
-    B: Block<Digest = H::Digest, Commitment = H::Digest>,
-    H: Hasher,
-{
+/// A struct that holds multiple subscriptions for a shard's validity check.
+struct ShardValiditySubscription {
     /// The subscribers that are waiting for the chunk
-    subscribers: Vec<oneshot::Sender<Shard<CodedBlock<B, H>, H>>>,
+    subscribers: Vec<oneshot::Sender<bool>>,
     /// Aborter that aborts the waiter future when dropped
     _aborter: Aborter,
 }
@@ -106,8 +102,8 @@ where
 
     // Outstanding subscriptions for blocks
     block_subscriptions: BTreeMap<B::Commitment, BlockSubscription<B>>,
-    // Outstanding subscriptions for chunks
-    chunk_subscriptions: BTreeMap<B::Commitment, ChunkSubscription<B, H>>,
+    // Outstanding subscriptions for shard validity checks
+    shard_validity_subscriptions: BTreeMap<(B::Commitment, u16), ShardValiditySubscription>,
 
     // ---------- Storage ----------
     // Prunable cache
@@ -248,7 +244,7 @@ where
                 codec_config: config.codec_config,
                 last_processed_round: Round::new(0, 0),
                 block_subscriptions: BTreeMap::new(),
-                chunk_subscriptions: BTreeMap::new(),
+                shard_validity_subscriptions: BTreeMap::new(),
                 cache,
                 finalizations_by_height,
                 finalized_blocks,
@@ -300,8 +296,7 @@ where
 
         // Create a local pool for waiter futures
         let mut block_waiters = AbortablePool::<(B::Commitment, CodedBlock<B, H>)>::default();
-        let mut chunk_waiters =
-            AbortablePool::<((B::Commitment, u16), Shard<CodedBlock<B, H>, H>)>::default();
+        let mut chunk_waiters = AbortablePool::<((B::Commitment, u16), bool)>::default();
 
         // Handle messages
         loop {
@@ -310,7 +305,7 @@ where
                 bs.subscribers.retain(|tx| !tx.is_canceled());
                 !bs.subscribers.is_empty()
             });
-            self.chunk_subscriptions.retain(|_, cs| {
+            self.shard_validity_subscriptions.retain(|_, cs| {
                 cs.subscribers.retain(|tx| !tx.is_canceled());
                 !cs.subscribers.is_empty()
             });
@@ -322,7 +317,13 @@ where
                     let Ok((commitment, block)) = result else {
                         continue; // Aborted future
                     };
-                    self.notify_subscribers(commitment, &block).await;
+                    self.notify_block_subscribers(commitment, &block).await;
+                },
+                result = chunk_waiters.next_completed() => {
+                    let Ok(((commitment, index), valid)) = result else {
+                        continue; // Aborted future
+                    };
+                    self.notify_shard_validity_subscribers(commitment, index, valid).await;
                 },
                 // Handle consensus before finalizer or backfiller
                 mailbox_message = self.mailbox.next() => {
@@ -331,82 +332,10 @@ where
                         return;
                     };
                     match message {
-                        Message::Broadcast { coding_commitment, config, chunks } => {
-                            shard_layer.broadcast_chunks(coding_commitment, config, chunks).await;
-                        }
-                        Message::Notarize { notarization } => {
-                            let commitment = notarization.proposal.payload;
-                            let index = notarization.proposal_signature.index as u16;
-                            shard_layer.try_broadcast_shard(commitment, index).await;
-                        }
-                        Message::Notarization { notarization } => {
-                            let round = notarization.round();
-                            let commitment = notarization.proposal.payload;
-
-                            // Store notarization by view
-                            self.cache.put_notarization(round, commitment, notarization.clone()).await;
-
-                            // Search for block locally, otherwise fetch it remotely
-                            if let Some(block) = self.find_block(&mut shard_layer, commitment).await {
-                                // If found, persist the block
-                                self.cache_block(round, commitment, block).await;
-                            } else {
-                                debug!(?round, "notarized block missing");
-                                resolver.fetch(Request::<CodedBlock<B, H>>::Notarized { round }).await;
-                            }
-                        }
-                        Message::Finalize { finalization } => {
-                            let commitment = finalization.proposal.payload;
-                            let index = finalization.proposal_signature.index as u16;
-                            shard_layer.try_broadcast_shard(commitment, index).await;
-                        }
-                        Message::Finalization { finalization } => {
-                            // Cache finalization by round
-                            let round = finalization.round();
-                            let commitment = finalization.proposal.payload;
-
-                            self.cache.put_finalization(round, commitment, finalization.clone()).await;
-
-                            // Search for block locally, otherwise fetch it remotely
-                            if let Some(block) = self.find_block(&mut shard_layer, commitment).await {
-                                // If found, persist the block
-                                let height = block.height();
-                                self.finalize(height, commitment, block, Some(finalization), &mut notifier_tx).await;
-                                debug!(?round, height, "finalized block stored");
-                            } else {
-                                // Otherwise, fetch the block from the network.
-                                debug!(?round, ?commitment, "finalized block missing");
-                                resolver.fetch(Request::<CodedBlock<B, H>>::Block(commitment)).await;
-                            }
-                        }
                         Message::Get { commitment, response } => {
                             // Check for block locally
                             let result = self.find_block(&mut shard_layer, commitment).await;
                             let _ = response.send(result.map(CodedBlock::take_inner));
-                        }
-                        Message::SubscribeChunk { commitment, index, response } => {
-                            // Check for chunk locally
-                            if let Some(shard) = shard_layer.get_chunk(commitment, index).await {
-                                let _ = response.send(shard);
-                                continue;
-                            }
-
-                            match self.chunk_subscriptions.entry(commitment) {
-                                Entry::Occupied(mut entry) => {
-                                    entry.get_mut().subscribers.push(response);
-                                }
-                                Entry::Vacant(entry) => {
-                                    let (tx, rx) = oneshot::channel();
-                                    shard_layer.subscribe_chunk(commitment, index, tx).await;
-                                    let aborter = chunk_waiters.push(async move {
-                                        ((commitment, index), rx.await.expect("shard subscriber closed"))
-                                    });
-                                    entry.insert(ChunkSubscription {
-                                        subscribers: vec![response],
-                                        _aborter: aborter,
-                                    });
-                                }
-                            }
                         }
                         Message::Subscribe { round, commitment, response } => {
                             // Check for block locally
@@ -452,6 +381,80 @@ where
                                         _aborter: aborter,
                                     });
                                 }
+                            }
+                        }
+                        Message::Broadcast { coding_commitment, config, chunks } => {
+                            shard_layer.broadcast_chunks(coding_commitment, config, chunks).await;
+                        }
+                        Message::VerifyShard { commitment, index, response } => {
+                            // Check for chunk locally
+                            if let Some(shard) = shard_layer.get_chunk(commitment, index).await {
+                                let _ = response.send(shard.verify(index, &commitment));
+                                continue;
+                            }
+
+                            match self.shard_validity_subscriptions.entry((commitment, index)) {
+                                Entry::Occupied(mut entry) => {
+                                    entry.get_mut().subscribers.push(response);
+                                }
+                                Entry::Vacant(entry) => {
+                                    let (tx, rx) = oneshot::channel();
+                                    shard_layer.subscribe_chunk(commitment, index, tx).await;
+                                    let aborter = chunk_waiters.push(async move {
+                                        let shard = rx.await.expect("shard subscriber closed");
+                                        let valid = shard.verify(index, &commitment);
+                                        ((commitment, index), valid)
+                                    });
+                                    entry.insert(ShardValiditySubscription {
+                                        subscribers: vec![response],
+                                        _aborter: aborter,
+                                    });
+                                }
+                            }
+                        }
+                        Message::Notarize { notarization } => {
+                            let commitment = notarization.proposal.payload;
+                            let index = notarization.proposal_signature.index as u16;
+                            shard_layer.try_broadcast_shard(commitment, index).await;
+                        }
+                        Message::Notarization { notarization } => {
+                            let round = notarization.round();
+                            let commitment = notarization.proposal.payload;
+
+                            // Store notarization by view
+                            self.cache.put_notarization(round, commitment, notarization.clone()).await;
+
+                            // Search for block locally, otherwise fetch it remotely
+                            if let Some(block) = self.find_block(&mut shard_layer, commitment).await {
+                                // If found, persist the block
+                                self.cache_block(round, commitment, block).await;
+                            } else {
+                                debug!(?round, "notarized block missing");
+                                resolver.fetch(Request::<CodedBlock<B, H>>::Notarized { round }).await;
+                            }
+                        }
+                        Message::Finalize { finalization } => {
+                            let commitment = finalization.proposal.payload;
+                            let index = finalization.proposal_signature.index as u16;
+                            shard_layer.try_broadcast_shard(commitment, index).await;
+                        }
+                        Message::Finalization { finalization } => {
+                            // Cache finalization by round
+                            let round = finalization.round();
+                            let commitment = finalization.proposal.payload;
+
+                            self.cache.put_finalization(round, commitment, finalization.clone()).await;
+
+                            // Search for block locally, otherwise fetch it remotely
+                            if let Some(block) = self.find_block(&mut shard_layer, commitment).await {
+                                // If found, persist the block
+                                let height = block.height();
+                                self.finalize(height, commitment, block, Some(finalization), &mut notifier_tx).await;
+                                debug!(?round, height, "finalized block stored");
+                            } else {
+                                // Otherwise, fetch the block from the network.
+                                debug!(?round, ?commitment, "finalized block missing");
+                                resolver.fetch(Request::<CodedBlock<B, H>>::Block(commitment)).await;
                             }
                         }
                     }
@@ -675,10 +678,31 @@ where
     // -------------------- Waiters --------------------
 
     /// Notify any subscribers for the given commitment with the provided block.
-    async fn notify_subscribers(&mut self, commitment: B::Commitment, block: &CodedBlock<B, H>) {
+    async fn notify_block_subscribers(
+        &mut self,
+        commitment: B::Commitment,
+        block: &CodedBlock<B, H>,
+    ) {
         if let Some(mut bs) = self.block_subscriptions.remove(&commitment) {
             for subscriber in bs.subscribers.drain(..) {
                 let _ = subscriber.send(block.clone().take_inner());
+            }
+        }
+    }
+
+    // Notify any subscribers waiting for shard validity.
+    async fn notify_shard_validity_subscribers(
+        &mut self,
+        commitment: B::Commitment,
+        index: u16,
+        valid: bool,
+    ) {
+        if let Some(mut cs) = self
+            .shard_validity_subscriptions
+            .remove(&(commitment, index))
+        {
+            for subscriber in cs.subscribers.drain(..) {
+                let _ = subscriber.send(valid);
             }
         }
     }
@@ -692,7 +716,7 @@ where
         commitment: B::Commitment,
         block: CodedBlock<B, H>,
     ) {
-        self.notify_subscribers(commitment, &block).await;
+        self.notify_block_subscribers(commitment, &block).await;
         self.cache.put_block(round, commitment, block).await;
     }
 
@@ -733,7 +757,7 @@ where
         finalization: Option<Finalization<V, B::Commitment>>,
         notifier: &mut mpsc::Sender<()>,
     ) {
-        self.notify_subscribers(commitment, &block).await;
+        self.notify_block_subscribers(commitment, &block).await;
 
         // In parallel, update the finalized blocks and finalizations archives
         if let Err(e) = try_join!(
