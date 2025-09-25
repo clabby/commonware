@@ -9,7 +9,7 @@
 
 use crate::Block;
 use commonware_broadcast::{buffered, Broadcaster};
-use commonware_codec::{EncodeSize, Error as CodecError, FixedSize, Read, ReadExt, Write};
+use commonware_codec::{Decode, EncodeSize, Error as CodecError, FixedSize, Read, ReadExt, Write};
 use commonware_coding::reed_solomon::{self, decode, Chunk, Error as ReedSolomonError};
 use commonware_cryptography::{Committable, Digestible, Hasher, PublicKey};
 use commonware_p2p::Recipients;
@@ -47,14 +47,14 @@ where
     B: Block<Digest = H::Digest, Commitment = H::Digest>,
     H: Hasher,
 {
-    /// Inner [`buffered::Mailbox`] for broadcasting and receiving erasure coded chunks.
-    mailbox: buffered::Mailbox<P, Shard<B, H>>,
+    /// Inner [`buffered::Mailbox`] for broadcasting and receiving erasure coded shards.
+    mailbox: buffered::Mailbox<P, Shard<CodedBlock<B, H>, H>>,
 
     /// [`Read`] configuration for the block type.
     block_codec_cfg: B::Cfg,
 
     /// Open subscriptions for blocks by commitment.
-    block_subscriptions: BTreeMap<B::Commitment, BlockSubscription<B>>,
+    block_subscriptions: BTreeMap<B::Commitment, BlockSubscription<CodedBlock<B, H>>>,
 }
 
 impl<P, B, H> ShardLayer<P, B, H>
@@ -64,7 +64,10 @@ where
     H: Hasher,
 {
     /// Create a new [ShardLayer] with the given buffered mailbox.
-    pub fn new(mailbox: buffered::Mailbox<P, Shard<B, H>>, block_codec_cfg: B::Cfg) -> Self {
+    pub fn new(
+        mailbox: buffered::Mailbox<P, Shard<CodedBlock<B, H>, H>>,
+        block_codec_cfg: B::Cfg,
+    ) -> Self {
         Self {
             mailbox,
             block_codec_cfg,
@@ -73,14 +76,9 @@ where
     }
 
     /// Broadcasts [Shard]s of a [Block] to a pre-determined set of peers.
-    pub async fn broadcast_chunks(
-        &mut self,
-        coding_commitment: B::Commitment,
-        config: (u16, u16),
-        chunks: Vec<(P, Chunk<H>)>,
-    ) {
-        for (peer, chunk) in chunks {
-            let message = Shard::new(coding_commitment, config, chunk);
+    pub async fn broadcast_shards(&mut self, block: CodedBlock<B, H>, participants: Vec<P>) {
+        for (i, peer) in participants.into_iter().enumerate() {
+            let message = block.shard(i as u16).expect("invalid shard index");
             let _peers = self.mailbox.broadcast(Recipients::One(peer), message).await;
         }
     }
@@ -113,14 +111,14 @@ where
     pub async fn try_reconstruct(
         &mut self,
         commitment: B::Commitment,
-    ) -> Result<Option<B>, ReconstructionError> {
-        let available_chunks = self.mailbox.get(None, commitment, None).await;
+    ) -> Result<Option<CodedBlock<B, H>>, ReconstructionError> {
+        let available_shards = self.mailbox.get(None, commitment, None).await;
 
-        let Some((total, min)) = available_chunks.first().map(|c| c.config) else {
-            // No chunks available.
+        let Some((total, min)) = available_shards.first().map(|c| c.config) else {
+            // No shards available.
             return Ok(None);
         };
-        let coded_chunks = available_chunks
+        let coded_shards = available_shards
             .iter()
             .cloned()
             .map(|c| c.chunk)
@@ -129,23 +127,24 @@ where
         // TODO: Make sure min is all valid chunks
         // TODO: If we do encounter a block that's invalid, block the peer.
 
-        if coded_chunks.len() < min as usize {
-            // Not enough chunks to recover the block yet.
+        if coded_shards.len() < min as usize {
+            // Not enough shards to recover the block yet.
             debug!(
                 %commitment,
-                have = coded_chunks.len(),
+                have = coded_shards.len(),
                 need = min,
-                "not enough chunks to reconstruct block",
+                "not enough shards to reconstruct block",
             );
             return Ok(None);
         }
 
-        // Attempt to recover the block from the available chunks. This process will also
-        // check the chunks' inclusion within the commitment.
-        let recovered = decode(total, min, &commitment, coded_chunks)?;
+        // Attempt to recover the block from the available shards. This process will also
+        // check the shards' inclusion within the commitment.
+        let recovered = decode(total, min, &commitment, coded_shards)?;
 
         // Attempt to decode the block from the recovered data.
-        let block = B::decode_cfg(&mut recovered.as_slice(), &self.block_codec_cfg)?;
+        let block =
+            CodedBlock::<B, H>::decode_cfg(&mut recovered.as_slice(), &self.block_codec_cfg)?;
 
         // Notify any subscribers that have been waiting for this block.
         if let Some(mut sub) = self.block_subscriptions.remove(&commitment) {
@@ -156,8 +155,8 @@ where
 
         info!(
             %commitment,
-            digest = %block.digest(),
-            height = block.height(),
+            digest = %block.inner().digest(),
+            height = block.inner().height(),
             "successfully reconstructed block"
         );
 
@@ -172,7 +171,7 @@ where
     pub async fn subscribe_block(
         &mut self,
         commitment: B::Commitment,
-        responder: oneshot::Sender<B>,
+        responder: oneshot::Sender<CodedBlock<B, H>>,
     ) -> Result<(), ReconstructionError> {
         match self.block_subscriptions.entry(commitment) {
             Entry::Vacant(entry) => {
@@ -185,36 +184,37 @@ where
             }
         }
 
-        // Try to reconstruct the block immediately in case we already have enough chunks.
+        // Try to reconstruct the block immediately in case we already have enough shards.
         self.try_reconstruct(commitment).await?;
 
         Ok(())
     }
 
-    pub async fn get_chunk(
+    /// Performs a best-effort retrieval of a shard by commitment and index. If the mailbox does
+    /// not have the shard cached, `None` is returned.
+    pub async fn get_shard(
         &mut self,
         commitment: B::Commitment,
         index: u16,
-    ) -> Option<Shard<B, H>> {
+    ) -> Option<Shard<CodedBlock<B, H>, H>> {
         let index_hash = shard_uuid::<B, H>(commitment, index);
         self.mailbox
             .get(None, commitment, Some(index_hash))
             .await
-            .iter()
+            .first()
             .cloned()
-            .next()
     }
 
-    /// Subscribes to a chunk by commitment and index with an externally prepared responder.
+    /// Subscribes to a shard by commitment and index with an externally prepared responder.
     ///
-    /// The responder will be sent the chunk when it is available; either instantly (if cached)
+    /// The responder will be sent the shard when it is available; either instantly (if cached)
     /// or when it is received from the network. The request can be canceled by dropping the
     /// responder.
-    pub async fn subscribe_chunk(
+    pub async fn subscribe_shard(
         &mut self,
         commitment: B::Commitment,
         index: u16,
-        responder: oneshot::Sender<Shard<B, H>>,
+        responder: oneshot::Sender<Shard<CodedBlock<B, H>, H>>,
     ) {
         let index_hash = shard_uuid::<B, H>(commitment, index);
         self.mailbox
@@ -225,10 +225,10 @@ where
 
 /// A broadcastable, erasure coded [Chunk] of a [Block].
 ///
-/// Each chunk is associated with a commitment to the full block's
-/// erasure coded data. This allows recipients to verify the integrity of the chunk
-/// (to varying degrees; For reed-solomon which is currently hard-coded, no guarantee
-/// of the chunk's correctness is possible without additional chunks.)
+/// Each shard is associated with a commitment to the full block's erasure coded data.
+/// This allows recipients to verify the integrity of the shard (to varying degrees; For
+/// reed-solomon which is currently hard-coded, no guarantee of the shard's correctness
+/// is possible without additional shard.)
 #[derive(Debug, Clone)]
 pub struct Shard<B, H>
 where
@@ -245,7 +245,7 @@ where
     B: Block<Digest = H::Digest, Commitment = H::Digest>,
     H: Hasher,
 {
-    /// Create a new [Shard] from a block's hash, coding commitment, and a chunk
+    /// Create a new [Shard] from a block's hash, coding commitment, and a [Chunk]
     /// of the coded block.
     ///
     /// ## Panics
@@ -442,6 +442,15 @@ where
     /// Returns a reference to the coded chunks.
     pub fn chunks(&self) -> &[Chunk<H>] {
         self.chunks.as_slice()
+    }
+
+    /// Returns a [Shard] at the given index, if the index is valid.
+    pub fn shard(&self, index: u16) -> Option<Shard<CodedBlock<B, H>, H>> {
+        Some(Shard::new(
+            self.commitment,
+            self.config,
+            self.chunks.get(index as usize)?.clone(),
+        ))
     }
 }
 

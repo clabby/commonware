@@ -202,7 +202,7 @@ mod tests {
         let network = oracle.register(secret.public_key(), 2).await.unwrap();
         broadcast_engine.start(network);
 
-        let shards = ShardLayer::new(buffer, ());
+        let shards = ShardLayer::<_, _, Sha256>::new(buffer, ());
 
         let (actor, mailbox) = actor::Actor::init(context.clone(), config).await;
         let application = Application::<B>::default();
@@ -412,10 +412,7 @@ mod tests {
                 let actor_index: usize = (height % (NUM_VALIDATORS as u64)) as usize;
                 let mut actor = actors[actor_index].clone();
 
-                let peers_and_chunks = peers.iter().cloned().zip(block.chunks().to_vec()).collect();
-                actor
-                    .broadcast(block.commitment(), block.config(), peers_and_chunks)
-                    .await;
+                actor.broadcast(block.clone(), peers.clone()).await;
 
                 // Wait for the block chunks to be delivered; Before making notarization votes,
                 // the chunks must be present.

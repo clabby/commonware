@@ -260,7 +260,7 @@ where
     pub fn start<R>(
         mut self,
         application: impl Reporter<Activity = B>,
-        shards: ShardLayer<P, CodedBlock<B, H>, H>,
+        shards: ShardLayer<P, B, H>,
         resolver: (mpsc::Receiver<handler::Message<CodedBlock<B, H>>>, R),
     ) -> Handle<()>
     where
@@ -273,7 +273,7 @@ where
     async fn run<R>(
         mut self,
         application: impl Reporter<Activity = B>,
-        mut shard_layer: ShardLayer<P, CodedBlock<B, H>, H>,
+        mut shard_layer: ShardLayer<P, B, H>,
         (mut resolver_rx, mut resolver): (mpsc::Receiver<handler::Message<CodedBlock<B, H>>>, R),
     ) where
         R: Resolver<Key = handler::Request<CodedBlock<B, H>>>,
@@ -383,12 +383,12 @@ where
                                 }
                             }
                         }
-                        Message::Broadcast { coding_commitment, config, chunks } => {
-                            shard_layer.broadcast_chunks(coding_commitment, config, chunks).await;
+                        Message::Broadcast { block, participants } => {
+                            shard_layer.broadcast_shards(block, participants).await;
                         }
                         Message::VerifyShard { commitment, index, response } => {
                             // Check for chunk locally
-                            if let Some(shard) = shard_layer.get_chunk(commitment, index).await {
+                            if let Some(shard) = shard_layer.get_shard(commitment, index).await {
                                 let _ = response.send(shard.verify(index, &commitment));
                                 continue;
                             }
@@ -399,7 +399,7 @@ where
                                 }
                                 Entry::Vacant(entry) => {
                                     let (tx, rx) = oneshot::channel();
-                                    shard_layer.subscribe_chunk(commitment, index, tx).await;
+                                    shard_layer.subscribe_shard(commitment, index, tx).await;
                                     let aborter = chunk_waiters.push(async move {
                                         let shard = rx.await.expect("shard subscriber closed");
                                         let valid = shard.verify(index, &commitment);
@@ -790,7 +790,7 @@ where
     /// Looks for a block anywhere in local storage.
     async fn find_block(
         &mut self,
-        shards: &mut ShardLayer<P, CodedBlock<B, H>, H>,
+        shards: &mut ShardLayer<P, B, H>,
         commitment: B::Commitment,
     ) -> Option<CodedBlock<B, H>> {
         // Check shard layer.
