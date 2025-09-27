@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 
 /// An [Application] adapter that handles erasure coding and shard verification for consensus.
 #[derive(Clone)]
+#[allow(clippy::type_complexity)]
 pub struct CodingAdapter<E, A, V, B, S, P, Z>
 where
     E: Rng + Spawner + Metrics + Clock,
@@ -120,6 +121,8 @@ where
             .supervisor
             .is_participant(context.round, &self.identity)
             .expect("failed to get self index among participants");
+
+        #[allow(clippy::async_yields_async)]
         self.context
             .with_label("verify")
             .spawn(move |_| async move { marshal.verify_shard(payload, self_index as usize).await })
